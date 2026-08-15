@@ -2523,6 +2523,14 @@ struct Args {
     #[arg(long)]
     nnue_pytorch_wrm_loss: bool,
 
+    /// WRM constants as `nnue2score,offset,in_scaling,out_scaling,pow`.
+    /// Default keeps the nodchip values (600,270,340,380,2.5).
+    /// shogi-nnue production recipe: `600,0,285,285,2` (offset=0 reduces the
+    /// WRM to a plain sigmoid(score/285), pow=2). Applies to the loss kernel,
+    /// the CPU golden loss, the target-conversion table and validation.
+    #[arg(long, value_delimiter = ',', num_args = 5)]
+    wrm_constants: Option<Vec<f32>>,
+
     /// Optimizer weight decay for the selected optimizer. Default follows
     /// the tatara SFNN-1536 reference recipe.
     #[arg(long, default_value = "0.0")]
@@ -3513,6 +3521,25 @@ fn main() {
             }
         }
     }
+    if let Some(c) = &args.wrm_constants {
+        // ★データローダ/損失の初回使用より前に呼ぶこと (ターゲット変換テーブルが
+        //   OnceLock キャッシュのため)。GPU カーネル側にも同じ値を渡す。
+        let params = bulletou_lib::value::WrmParams {
+            nnue2score: c[0],
+            offset: c[1],
+            in_scaling: c[2],
+            out_scaling: c[3],
+            pow_exp: c[4],
+        };
+        bulletou_lib::value::set_wrm_params(params);
+        #[cfg(feature = "cuda-cpp-backend")]
+        bulletou_cuda_cpp::set_wrm_loss_params(c[0], c[1], c[2], c[4]);
+        println!(
+            "WRM constants: nnue2score={} offset={} in_scaling={} out_scaling={} pow={}",
+            c[0], c[1], c[2], c[3], c[4]
+        );
+    }
+
     if args.nnue_pytorch_wrm_loss && !args.eval_type().supports_nnue_pytorch_wrm_loss() {
         eprintln!("error: --nnue-pytorch-wrm-loss currently applies to NNUE / SFNN eval types only.");
         std::process::exit(2);

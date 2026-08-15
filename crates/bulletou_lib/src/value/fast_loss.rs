@@ -90,23 +90,10 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 fn nnue_pytorch_wrm_loss_and_gradient(output: f32, target: f32) -> (f32, f32) {
-    const NNUE2SCORE: f32 = 600.0;
-    const IN_OFFSET: f32 = 270.0;
-    const IN_SCALING: f32 = 340.0;
-    const POW_EXP: f32 = 2.5;
-
-    let scorenet = output * NNUE2SCORE;
-    let q = sigmoid((scorenet - IN_OFFSET) / IN_SCALING);
-    let qm = sigmoid((-scorenet - IN_OFFSET) / IN_SCALING);
-    let prediction = (1.0 + q - qm) * 0.5;
-    let error = prediction - target;
-    let abs_error = error.abs();
-    let loss = abs_error.powf(POW_EXP);
-    let q_prime = q * (1.0 - q);
-    let qm_prime = qm * (1.0 - qm);
-    let prediction_gradient = 0.5 * (NNUE2SCORE / IN_SCALING) * (q_prime + qm_prime);
-    let loss_gradient = POW_EXP * error.signum() * abs_error.powf(POW_EXP - 1.0);
-    (loss, loss_gradient * prediction_gradient)
+    // 定数は wrm_params (既定 = nodchip: 600/270/340/2.5) から取る。
+    // 数式本体は純関数 wrm_loss_and_gradient に分離してある (テストはそちらへ)。
+    let params = super::wrm_params::wrm_params();
+    super::wrm_params::wrm_loss_and_gradient(&params, output, target)
 }
 
 #[cfg(test)]

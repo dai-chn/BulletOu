@@ -1137,12 +1137,13 @@ __global__ void loss_nnue_pytorch_wrm_reduce_kernel(
     const float* entry_weights,
     float* per_sample,
     float* mean_output_gradients,
+    // 旧: constexpr (600/270/340/2.5 = nodchip nnue-pytorch)。shogi-nnue レシピ
+    // (600/0/285/2) 等へ差し替えられるよう実行時引数化した。既定値はホスト側で維持。
+    float NNUE2SCORE,
+    float IN_OFFSET,
+    float IN_SCALING,
+    float POW_EXP,
     size_t batch) {
-    constexpr float NNUE2SCORE = 600.0f;
-    constexpr float IN_OFFSET = 270.0f;
-    constexpr float IN_SCALING = 340.0f;
-    constexpr float POW_EXP = 2.5f;
-
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= batch) {
         return;
@@ -4347,6 +4348,10 @@ int launch_scalar_loss_kernels(
     BulletOuCudaCppContext* ctx,
     int kind,
     float output_inv_scale,
+    float wrm_nnue2score,
+    float wrm_offset,
+    float wrm_in_scaling,
+    float wrm_pow_exp,
     size_t batch,
     const float* outputs,
     const float* targets,
@@ -4388,6 +4393,10 @@ int launch_scalar_loss_kernels(
             entry_weights,
             per_sample,
             mean_output_gradients,
+            wrm_nnue2score,
+            wrm_offset,
+            wrm_in_scaling,
+            wrm_pow_exp,
             batch);
         if (check_kernel_launch("loss_nnue_pytorch_wrm_reduce_kernel launch") != 0) {
             return -1;
@@ -5915,6 +5924,10 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
     BulletOuCudaCppContext* ctx,
     int kind,
     float output_inv_scale,
+    float wrm_nnue2score,
+    float wrm_offset,
+    float wrm_in_scaling,
+    float wrm_pow_exp,
     size_t batch,
     const BulletOuCudaCppF32Buffer* outputs,
     const BulletOuCudaCppF32Buffer* targets,
@@ -5939,6 +5952,10 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device_with_finalize(
             ctx,
             kind,
             output_inv_scale,
+            wrm_nnue2score,
+            wrm_offset,
+            wrm_in_scaling,
+            wrm_pow_exp,
             batch,
             outputs->ptr,
             targets->ptr,
@@ -5958,6 +5975,10 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device(
     BulletOuCudaCppContext* ctx,
     int kind,
     float output_inv_scale,
+    float wrm_nnue2score,
+    float wrm_offset,
+    float wrm_in_scaling,
+    float wrm_pow_exp,
     size_t batch,
     const BulletOuCudaCppF32Buffer* outputs,
     const BulletOuCudaCppF32Buffer* targets,
@@ -5970,6 +5991,10 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_device(
         ctx,
         kind,
         output_inv_scale,
+        wrm_nnue2score,
+        wrm_offset,
+        wrm_in_scaling,
+        wrm_pow_exp,
         batch,
         outputs,
         targets,
@@ -6082,6 +6107,10 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_host(
     int device,
     int kind,
     float output_inv_scale,
+    float wrm_nnue2score,
+    float wrm_offset,
+    float wrm_in_scaling,
+    float wrm_pow_exp,
     size_t batch,
     const float* outputs,
     const float* targets,
@@ -6132,6 +6161,10 @@ extern "C" int bulletou_cuda_cpp_scalar_loss_host(
             ctx,
             kind,
             output_inv_scale,
+            wrm_nnue2score,
+            wrm_offset,
+            wrm_in_scaling,
+            wrm_pow_exp,
             batch,
             d_outputs,
             d_targets,

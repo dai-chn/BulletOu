@@ -276,17 +276,25 @@ pub fn compute_sign_accuracy_with_loss(
             };
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::NnuePytorchWrm => wrm_probability(f32::from(s), 270.0, 380.0),
+                ValidationLossKind::NnuePytorchWrm => {
+                    let p = crate::value::wrm_params::wrm_params();
+                    wrm_probability(f32::from(s), p.offset, p.out_scaling)
+                }
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
                 ValidationLossKind::SigmoidMse => sigmoid(*m * model_inv_scale),
-                ValidationLossKind::NnuePytorchWrm => wrm_probability(*m * 600.0, 270.0, 340.0),
+                ValidationLossKind::NnuePytorchWrm => {
+                    let p = crate::value::wrm_params::wrm_params();
+                    wrm_probability(*m * p.nnue2score, p.offset, p.in_scaling)
+                }
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
                 ValidationLossKind::SigmoidMse => diff * diff,
-                ValidationLossKind::NnuePytorchWrm => diff.abs().powf(2.5),
+                ValidationLossKind::NnuePytorchWrm => {
+                    diff.abs().powf(crate::value::wrm_params::wrm_params().pow_exp)
+                }
             };
             report.loss_sampled += 1;
         }

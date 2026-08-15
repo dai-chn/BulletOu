@@ -492,12 +492,14 @@ static WIN_RATE_MODEL_SCORE_TABLE: OnceLock<Box<[f32]>> = OnceLock::new();
 
 pub(crate) fn initialise_win_rate_model_score_table() -> &'static [f32] {
     WIN_RATE_MODEL_SCORE_TABLE.get_or_init(|| {
+        // 定数 (旧: offset=270, out_scaling=380 固定) は wrm_params から取る。
+        // このテーブルは OnceLock キャッシュなので、set_wrm_params は必ず
+        // 初回のデータロードより前に呼ぶこと (wrm_params 側の使用済みガード参照)。
+        let params = crate::value::wrm_params::wrm_params();
         let mut values = Vec::with_capacity(usize::from(u16::MAX) + 1);
         for raw_score in i32::from(i16::MIN)..=i32::from(i16::MAX) {
             let score = raw_score as f32;
-            let p = (score - 270.0) / 380.0;
-            let pm = (-score - 270.0) / 380.0;
-            values.push(0.5 * (1.0 + sigmoid(p) - sigmoid(pm)));
+            values.push(crate::value::wrm_params::wrm_target(&params, score));
         }
         values.into_boxed_slice()
     })

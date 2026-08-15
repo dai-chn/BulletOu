@@ -9,6 +9,7 @@ pub mod nnue_save;
 pub mod nnue_save_sfnn1536;
 mod save;
 pub mod teacher_batch;
+pub mod wrm_params;
 pub mod yaneuraou_kppt;
 
 use std::cell::RefCell;
@@ -24,6 +25,7 @@ use bullet_trainer::{
 pub use dataloader::FastValueDataLoader;
 pub use fast_batch::{FastBatchHost, FastBatchLayout, FastReferenceError, ForwardComparison, compare_forward_outputs};
 pub use fast_loss::{FastLossError, ScalarValueLossKind, ScalarValueLossTrace, scalar_value_loss_trace};
+pub use wrm_params::{WrmParams, set_wrm_params, wrm_params};
 pub use fast_nnue::{
     FastNnueError, NNUE_HALFKP_256X2_32_32, NnueForwardOwnedWeights, NnueForwardShape, NnueForwardTrace,
     NnueForwardWeights, NnueForwardWorkspaceLayout,

@@ -1595,6 +1595,25 @@ pub enum ScalarLossKind {
     NnuePytorchWrm,
 }
 
+/// WRM 損失カーネルの実行時パラメータ (nnue2score, offset, in_scaling, pow_exp)。
+///
+/// upstream はカーネル内 constexpr (600/270/340/2.5 = nodchip) だった。
+/// 既定値はそのまま維持し、shogi-nnue レシピ (600/0/285/2) 等へ差し替えられるようにする。
+/// ★ホスト側 `bulletou_lib` のターゲット変換 (`set_wrm_params`) と必ず同時に設定すること。
+static WRM_LOSS_PARAMS: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();
+
+/// WRM カーネルパラメータを設定する (損失の初回呼び出しより前に 1 回だけ)。
+pub fn set_wrm_loss_params(nnue2score: f32, offset: f32, in_scaling: f32, pow_exp: f32) {
+    assert!(
+        WRM_LOSS_PARAMS.set([nnue2score, offset, in_scaling, pow_exp]).is_ok(),
+        "set_wrm_loss_params must be called at most once"
+    );
+}
+
+fn wrm_loss_params() -> [f32; 4] {
+    *WRM_LOSS_PARAMS.get().unwrap_or(&[600.0, 270.0, 340.0, 2.5])
+}
+
 impl ScalarLossKind {
     fn as_ffi(self) -> i32 {
         match self {
@@ -1764,6 +1783,10 @@ pub fn scalar_loss_host(
             device,
             kind.as_ffi(),
             output_inv_scale,
+            wrm_loss_params()[0],
+            wrm_loss_params()[1],
+            wrm_loss_params()[2],
+            wrm_loss_params()[3],
             batch_size,
             batch.outputs.as_ptr(),
             batch.targets.as_ptr(),
@@ -1850,6 +1873,10 @@ fn scalar_loss_device_from_buffers_with_finalize(
             ctx.as_ptr(),
             kind.as_ffi(),
             output_inv_scale,
+            wrm_loss_params()[0],
+            wrm_loss_params()[1],
+            wrm_loss_params()[2],
+            wrm_loss_params()[3],
             batch_size,
             outputs.as_ptr(),
             targets.as_ptr(),
@@ -6039,6 +6066,10 @@ mod ffi {
             ctx: *mut BulletOuCudaCppContext,
             kind: i32,
             output_inv_scale: f32,
+            wrm_nnue2score: f32,
+            wrm_offset: f32,
+            wrm_in_scaling: f32,
+            wrm_pow_exp: f32,
             batch: usize,
             outputs: *mut BulletOuCudaCppF32Buffer,
             targets: *mut BulletOuCudaCppF32Buffer,
@@ -6053,6 +6084,10 @@ mod ffi {
             device: i32,
             kind: i32,
             output_inv_scale: f32,
+            wrm_nnue2score: f32,
+            wrm_offset: f32,
+            wrm_in_scaling: f32,
+            wrm_pow_exp: f32,
             batch: usize,
             outputs: *const f32,
             targets: *const f32,
