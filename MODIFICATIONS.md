@@ -40,11 +40,32 @@ CUDA 12.8 の nvcc は MSVC 2026 (VS18) を弾く。
 `NVCC_APPEND_FLAGS=-allow-unsupported-compiler` を付けてビルドする
 (既存の動作実績あり)。
 
-## 未着手 / 既知の穴 (作業メモ)
+## 検証記録 (2026-08-15)
 
-- `ft_factorize` (HalfKP piece-factorizer): **ライブラリには完備**
-  (`ShogiHalfKPPieceFactorizer` + `Factorised` 結線 + `merge_factoriser` の単体テスト) だが、
-  trainer CLI からは到達不能 (`examples/bulletou.rs` でハードコード false)。
-  ★有効化する前に **quantised save が仮想行を fold するか**の数値検証が必須
-  (shogi-nnue 側で「ハッシュ通過・対局可能・ただ弱い」export 事故の前例がある)。
-- 移行のパリティ照合 (同一データ・同一レシピで既存学習器と loss/重みを照合) は未実施。
+### HalfKP factorization は「暗黙」実装で完備 — 追加実装不要と確認
+
+調査の結論: `ft_factorize: false` は正しい設定だった。HalfKP fast trainer は
+**常に factorized (input 126936 = 125388 + 1548)** で訓練し、CUDA カーネル
+`nnue_halfkp_factorized_feature` が raw index から base (=1548+feat) と
+virtual (=feat%1548) を**暗黙に両方 gather** する。batch 側は raw index のみでよい。
+save は `fold_halfkp_piece_factorized_l0w` (fold → 量子化の順、単体テスト付き) で
+125388 行へ畳んでから nn.bin に書く。
+
+### export 経路の独立数値検証: PASS
+
+30 step の smoke 訓練 (512x2-16-32, `--wrm-constants 600 0 285 285 2`) で export した
+nn.bin を、shogi-nnue 側の独立実装 (`tools/nnue_eval.py` の整数忠実 forward) と
+実配布エンジン (KisouEngine.exe) で照合し **60/60 局面が ±2cp 一致**。
+implicit factorization → fold → 量子化 → nn.bin の全経路が数値的に正しい。
+throughput 参考値: 4.27M pos/s (RTX 5060 Ti, 30 step の短時間測定)。
+
+### ビルドの罠
+
+`cargo test` は examples も**フィーチャー無しで再ビルド**し、
+`--features cuda-cpp-backend` で作った exe を上書きする。テスト後は example を
+作り直すこと (7.0MB → 1.1MB になっていたら feature 無し版)。
+
+## 未着手 (作業メモ)
+
+- loss レベルのパリティ照合 (同一データ・同一レシピで既存学習器 004d と
+  loss 曲線・最終重みを比較) — GPU が空き次第 (768 訓練後)。
