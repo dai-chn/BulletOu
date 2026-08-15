@@ -57,7 +57,10 @@ save は `fold_halfkp_piece_factorized_l0w` (fold → 量子化の順、単体�
 nn.bin を、shogi-nnue 側の独立実装 (`tools/nnue_eval.py` の整数忠実 forward) と
 実配布エンジン (KisouEngine.exe) で照合し **60/60 局面が ±2cp 一致**。
 implicit factorization → fold → 量子化 → nn.bin の全経路が数値的に正しい。
-throughput 参考値: 4.27M pos/s (RTX 5060 Ti, 30 step の短時間測定)。
+throughput: ★未確立。smoke の pos/s は train_elapsed (GPU step のみ、データ準備除外)
+ベースで、かつ測定時 GPU は別の訓練と共有状態だった。30 step で 4.27M / 300 step で
+445k と 10 倍ばらつく = 競合下の数字はどちら向きにも信用できない。
+アイドル GPU・同一アーキ・同一データ・壁時計での実測はパリティ照合と同時に行う。
 
 ### ビルドの罠
 
