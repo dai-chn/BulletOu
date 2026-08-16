@@ -2531,6 +2531,15 @@ struct Args {
     #[arg(long, value_delimiter = ',', num_args = 5)]
     wrm_constants: Option<Vec<f32>>,
 
+    /// NNUE fixed-layout trainer initial weights. `tatara-simple` (default) keeps the
+    /// upstream uniform |w|<=0.01 scratch. `bullet-kaiming` matches bullet-shogi's
+    /// ValueTrainerBuilder init (dense weights ~ Normal(0, sqrt(2/fan_in)), zero biases,
+    /// factorized FT rows all initialised) so 004d-recipe parity runs start from the
+    /// same distribution. Parity evidence: with tatara-simple the same recipe converged
+    /// ~10-18% worse in 2sb loss / holdout MSE than 004d (2026-08-16).
+    #[arg(long, default_value = "tatara-simple")]
+    nnue_init: String,
+
     /// Optimizer weight decay for the selected optimizer. Default follows
     /// the tatara SFNN-1536 reference recipe.
     #[arg(long, default_value = "0.0")]
@@ -9126,29 +9135,47 @@ fn build_nnue_initial_weights_for_cuda_cpp(
     let l1_input_dim = 2 * l1_size;
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
     let l0w_len = cuda_cpp_nnue_l0w_len_for_shape(shape)?;
-    let l0w = if virtual_rows == 0 {
-        cuda_cpp_tatara_uniform_abs_init(l0w_len, 0x5071_e001, 0.01)
-    } else {
-        let mut l0w = vec![0.0_f32; l0w_len];
-        let base_l0w = cuda_cpp_tatara_uniform_abs_init(base_input_size * l1_size, 0x5071_e001, 0.01);
-        for row in 0..base_input_size {
-            let src_start = row * l1_size;
-            let dst_start = (virtual_rows + row) * l1_size;
-            l0w[dst_start..dst_start + l1_size].copy_from_slice(&base_l0w[src_start..src_start + l1_size]);
+    let weights = match args.nnue_init.as_str() {
+        "tatara-simple" => {
+            let l0w = if virtual_rows == 0 {
+                cuda_cpp_tatara_uniform_abs_init(l0w_len, 0x5071_e001, 0.01)
+            } else {
+                let mut l0w = vec![0.0_f32; l0w_len];
+                let base_l0w = cuda_cpp_tatara_uniform_abs_init(base_input_size * l1_size, 0x5071_e001, 0.01);
+                for row in 0..base_input_size {
+                    let src_start = row * l1_size;
+                    let dst_start = (virtual_rows + row) * l1_size;
+                    l0w[dst_start..dst_start + l1_size].copy_from_slice(&base_l0w[src_start..src_start + l1_size]);
+                }
+                l0w
+            };
+            NnueForwardOwnedWeights {
+                shape,
+                l0w,
+                l0b: cuda_cpp_tatara_uniform_abs_init(l1_size, 0x5071_e002, 0.01),
+                l1w: cuda_cpp_tatara_uniform_abs_init(l1_input_dim * l2_size, 0x5071_e003, 0.01),
+                l1b: cuda_cpp_tatara_uniform_abs_init(l2_size, 0x5071_e004, 0.01),
+                l2w: cuda_cpp_tatara_uniform_abs_init(l2_size * l3_size, 0x5071_e005, 0.01),
+                l2b: cuda_cpp_tatara_uniform_abs_init(l3_size, 0x5071_e006, 0.01),
+                outw: cuda_cpp_tatara_uniform_abs_init(l3_size, 0x5071_e007, 0.01),
+                outb: cuda_cpp_tatara_uniform_abs_init(1, 0x5071_e008, 0.01),
+            }
         }
-        l0w
-    };
-
-    let weights = NnueForwardOwnedWeights {
-        shape,
-        l0w,
-        l0b: cuda_cpp_tatara_uniform_abs_init(l1_size, 0x5071_e002, 0.01),
-        l1w: cuda_cpp_tatara_uniform_abs_init(l1_input_dim * l2_size, 0x5071_e003, 0.01),
-        l1b: cuda_cpp_tatara_uniform_abs_init(l2_size, 0x5071_e004, 0.01),
-        l2w: cuda_cpp_tatara_uniform_abs_init(l2_size * l3_size, 0x5071_e005, 0.01),
-        l2b: cuda_cpp_tatara_uniform_abs_init(l3_size, 0x5071_e006, 0.01),
-        outw: cuda_cpp_tatara_uniform_abs_init(l3_size, 0x5071_e007, 0.01),
-        outb: cuda_cpp_tatara_uniform_abs_init(1, 0x5071_e008, 0.01),
+        // bullet-shogi の ValueTrainerBuilder (acyclib new_affine) と同分布:
+        // 重み N(0, sqrt(2/fan_in)) / バイアス 0。FT は仮想行も含む全行を初期化する
+        // (bullet の Factorised 入力は全行が同分布で始まるため)。
+        "bullet-kaiming" => NnueForwardOwnedWeights {
+            shape,
+            l0w: cuda_cpp_bullet_kaiming_init(l0w_len, 0x5071_e001, input_size),
+            l0b: vec![0.0; l1_size],
+            l1w: cuda_cpp_bullet_kaiming_init(l1_input_dim * l2_size, 0x5071_e003, l1_input_dim),
+            l1b: vec![0.0; l2_size],
+            l2w: cuda_cpp_bullet_kaiming_init(l2_size * l3_size, 0x5071_e005, l2_size),
+            l2b: vec![0.0; l3_size],
+            outw: cuda_cpp_bullet_kaiming_init(l3_size, 0x5071_e007, l3_size),
+            outb: vec![0.0; 1],
+        },
+        other => return Err(format!("unknown --nnue-init: {other} (expected tatara-simple / bullet-kaiming)")),
     };
     validate_cuda_cpp_nnue_owned_weights(feature_kind, &weights)?;
     Ok(weights)
@@ -10106,6 +10133,27 @@ fn quantization_error(path: &Path, name: &'static str, target: &'static str, val
 fn cuda_cpp_tatara_uniform_abs_init(len: usize, seed: u64, half_width: f32) -> Vec<f32> {
     let mut rng = CudaCppTataraXorShift::new(seed);
     (0..len).map(|_| rng.next_signed_unit() * half_width).collect()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+/// bullet-shogi (acyclib) の new_affine と同じ Kaiming Normal: N(0, sqrt(2/fan_in))。
+/// Box-Muller。決定的 (seed 固定) で再現可能。
+fn cuda_cpp_bullet_kaiming_init(len: usize, seed: u64, fan_in: usize) -> Vec<f32> {
+    let stdev = (2.0_f32 / fan_in.max(1) as f32).sqrt();
+    let mut rng = CudaCppTataraXorShift::new(seed);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        // (0,1] の一様 2 つから Box-Muller
+        let u1 = (rng.next_signed_unit() * 0.5 + 0.5).max(1e-12);
+        let u2 = rng.next_signed_unit() * 0.5 + 0.5;
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        out.push(r * theta.cos() * stdev);
+        if out.len() < len {
+            out.push(r * theta.sin() * stdev);
+        }
+    }
+    out
 }
 
 #[cfg(feature = "cuda-cpp-backend")]

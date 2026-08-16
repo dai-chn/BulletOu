@@ -68,7 +68,35 @@ throughput: ★未確立。smoke の pos/s は train_elapsed (GPU step のみ、
 `--features cuda-cpp-backend` で作った exe を上書きする。テスト後は example を
 作り直すこと (7.0MB → 1.1MB になっていたら feature 無し版)。
 
-## 未着手 (作業メモ)
+## パリティ照合の結果と追加修正 (2026-08-16)
 
-- loss レベルのパリティ照合 (同一データ・同一レシピで既存学習器 004d と
-  loss 曲線・最終重みを比較) — GPU が空き次第 (768 訓練後)。
+同一データ (ryfamate quiet 28 shard, 240M 局面)・同一レシピ (batch 16384 / LR 0.001 固定 /
+WRM 600,0,285,285,2 / decay 0.01 / beta1 0.99) で bullet-shogi (crate 004d) と 2sb 比較。
+初回は **loss +10〜14% / holdout MSE +12〜28% の劣化**を検出した。切り分けの結果:
+
+| 仮説 | 判定 |
+|---|---|
+| weight decay | ✗ (0 にしても不変) |
+| beta1 0.9→0.99 | ✗ (0.3% のみ。ただし bullet と揃える意味で 0.99 推奨) |
+| backward の仮想行散布 | ✗ 正常 |
+| **init スケール** | △ sb1 の差を説明 → `--nnue-init bullet-kaiming` を追加 |
+| RAdam の (1−β2^t) 欠落 | ✗ 原因ではないが標準形からの逸脱 → 修正 (下記) |
+| データ順 | ✗ 両者とも厳密逐次 |
+| Lookahead 式 | ✗ 同一 |
+| TF32 | ✗ 既定 OFF |
+| **`--use_fast_math`** | **★真因。** 近似 exp/sqrt/除算の系統誤差が収束品質を蝕む |
+
+**修正一式 (全部込みで 004d 同等以上を確認: sb2 loss 0.983×、holdout 0.958〜0.982×):**
+
+1. `crates/cuda_cpp/build.rs`: `--use_fast_math` を除去 (bullet-shogi は不使用)。
+   ローカルではローダ律速のため wall throughput はほぼ不変 (688k→665k pos/s)。
+2. `crates/cuda_cpp/src/lib.rs` `step_scale()`: RAdam の v バイアス補正 `(1−β2^t)` を追加
+   (bullet-shogi / PyTorch と同形。upstream は欠落しており序盤ステップが最大 ~3 倍過大)。
+3. `examples/bulletou.rs`: `--nnue-init bullet-kaiming` を追加
+   (重み N(0, sqrt(2/fan_in)) / バイアス 0。既定 `tatara-simple` は不変)。
+4. `crates/bulletou_lib/src/teacher_path.rs`: `.bin` 拡張子を PSV として受理
+   (既存プールの全 shard が `.bin` のため)。
+
+★004d レシピを BulletOu で再現するときの必須フラグ:
+`--nnue-init bullet-kaiming --optimizer-beta1 0.99 --optimizer-weight-decay 0.01
+ --wrm-constants 600 0 285 285 2 --nnue-pytorch-wrm-loss --lambda 1.0`

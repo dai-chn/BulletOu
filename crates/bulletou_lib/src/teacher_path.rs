@@ -91,6 +91,10 @@ pub fn infer_data_format(paths: &[&str]) -> Result<DataFormat, String> {
             Some("hcpe3") => DataFormat::Hcpe3,
             Some("pack") => DataFormat::Pack,
             Some("psv") => DataFormat::Psv,
+            // shogi-nnue: 既存プール (hetzner 由来の全 shard) は PSV レコードを `.bin`
+            // 拡張子で持つ。リネーム/ハードリンクを挟まずそのまま読めるようにする。
+            // .bin は本来曖昧だが、PSV は 40 byte 固定長でロード時にサイズ検証される。
+            Some("bin") => DataFormat::Psv,
             _ => {
                 return Err(format!(
                     "cannot infer data format from path: {p}\n  expected file extension: .hcpe / .hcpe3 / .pack / .psv"

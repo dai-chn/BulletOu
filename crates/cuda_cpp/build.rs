@@ -44,6 +44,10 @@ fn main() {
     build.file("cpp/bulletou_cuda_backend.cu");
     build.flag("-std=c++17");
     build.flag("-O3");
-    build.flag("--use_fast_math");
+    // ★--use_fast_math は外した (shogi-nnue fork)。
+    //   bullet-shogi はこのフラグ無しでビルドされており、パリティ照合で
+    //   同一レシピの損失が +11% 劣化する差の候補として検証するため。
+    //   (近似 expf は WRM 損失勾配に、prec-sqrt=false は RAdam の sqrt(v) に系統誤差を入れる)
+    // build.flag("--use_fast_math");
     build.compile("bulletou_cuda_cpp_backend");
 }

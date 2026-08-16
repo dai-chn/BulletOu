@@ -5708,7 +5708,11 @@ impl RAdamUpdateParams {
             let p1 = (n_sma - 4.0) / (n_sma_max - 4.0);
             let p2 = (n_sma - 2.0) / n_sma;
             let p3 = n_sma_max / (n_sma_max - 2.0);
-            (p1 * p2 * p3).sqrt() / bias_correction1
+            // ★(1 - β2^t) は v のバイアス補正 (RAdam 標準形。bullet-shogi / PyTorch と同じ)。
+            //   upstream はこれを欠いており、序盤の適応ステップが最大 ~3 倍過大になっていた。
+            //   同一レシピのパリティ照合で bullet-shogi 比 +11% の損失劣化として検出 (2026-08-16)。
+            //   カーネル側は生の sqrt(v) で割るので、補正はここで step_size に畳み込む。
+            ((1.0 - beta2_t) * p1 * p2 * p3).sqrt() / bias_correction1
         } else {
             1.0 / bias_correction1
         };
