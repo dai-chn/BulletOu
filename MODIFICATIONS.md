@@ -95,7 +95,14 @@ WRM 600,0,285,285,2 / decay 0.01 / beta1 0.99) で bullet-shogi (crate 004d) と
 3. `examples/bulletou.rs`: `--nnue-init bullet-kaiming` を追加
    (重み N(0, sqrt(2/fan_in)) / バイアス 0。既定 `tatara-simple` は不変)。
 4. `crates/bulletou_lib/src/teacher_path.rs`: `.bin` 拡張子を PSV として受理
-   (既存プールの全 shard が `.bin` のため)。
+   (既存プールの全 shard が `.bin` のため)。**2 箇所**要る:
+   `infer_data_format()` (単一ファイル/明示リスト用) と `TEACHER_EXTS`
+   (ディレクトリ走査用)。前者だけ直すとディレクトリ指定で
+   "no teacher files found" になる (実際に踏んだ)。
+   ★1925 shard をカンマ連結すると 146,248 文字となり Windows のコマンドライン上限
+   (32,767) を超えてプロセスが無言で起動しないので、大規模プールは
+   **ディレクトリ指定**が必須。使う前に「走査結果 == 意図した shard 集合」を
+   照合すること (今回は 1925 = 1925 差分ゼロを確認してから使った)。
 
 ★004d レシピを BulletOu で再現するときの必須フラグ:
 `--nnue-init bullet-kaiming --optimizer-beta1 0.99 --optimizer-weight-decay 0.01

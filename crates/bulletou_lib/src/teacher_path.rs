@@ -14,7 +14,10 @@
 use std::path::Path;
 
 /// Supported teacher-file extensions (lowercase, no leading dot).
-pub const TEACHER_EXTS: &[&str] = &["hcpe", "hcpe3", "pack", "psv"];
+// shogi-nnue: `.bin` を追加。既存プール (hetzner 由来の全 shard) は PSV レコードを
+// `.bin` 拡張子で持つため、ディレクトリ指定でも拾えるようにする
+// (infer_data_format 側でも .bin → Psv と解釈する)。
+pub const TEACHER_EXTS: &[&str] = &["hcpe", "hcpe3", "pack", "psv", "bin"];
 
 /// Teacher file format inferred from the file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
