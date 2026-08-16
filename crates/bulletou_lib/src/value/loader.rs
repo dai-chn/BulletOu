@@ -20,8 +20,29 @@ pub use viribinpack::{ViriBinpackLoader, ViriFilter};
 use bulletformat::BulletFormat;
 use rayon::prelude::*;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
+
+/// `max_active` を超える特徴数を持っていて切り詰めたレコードの通算件数。
+static FEATURE_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+
+/// 切り詰めの発生を記録する。最初の数件と、その後は 2 の冪の件数でだけ出力する
+/// (全件出すと異常データが多い場合にログが埋まる)。
+#[cold]
+fn report_feature_overflow(got: usize, max_active: usize) {
+    let n = FEATURE_OVERFLOWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 5 || n.is_power_of_two() {
+        eprintln!(
+            "[warn] 特徴数が max_active を超えたレコードを切り詰めた: {got} > {max_active} (通算 {n} 件)"
+        );
+    }
+}
+
+/// 切り詰めたレコードの通算件数を返す。訓練終了時の健全性レポート用。
+pub fn feature_overflow_count() -> u64 {
+    FEATURE_OVERFLOWS.load(Ordering::Relaxed)
+}
 
 use super::Wgt;
 
@@ -336,20 +357,31 @@ where
                                 inp.map_features_split(pos, |our_opt, opp_opt| {
                                     if let Some(our) = our_opt {
                                         assert!(our < input_size, "STM feature index exceeded input size!");
-                                        stm_chunk[sparse_offset + j_stm] = our as i32;
+                                        // ★境界チェックは書き込みの**前**に行う。溢れてから assert すると、
+                                        //   はみ出した分が隣のレコードの領域を踏んだ後に発覚する
+                                        //   (= 静かなデータ汚染)。
+                                        if j_stm < max_active {
+                                            stm_chunk[sparse_offset + j_stm] = our as i32;
+                                        }
                                         j_stm += 1;
                                     }
                                     if let Some(opp) = opp_opt {
                                         assert!(opp < input_size, "NSTM feature index exceeded input size!");
-                                        nstm_chunk[sparse_offset + j_nstm] = opp as i32;
+                                        if j_nstm < max_active {
+                                            nstm_chunk[sparse_offset + j_nstm] = opp as i32;
+                                        }
                                         j_nstm += 1;
                                     }
                                 });
 
-                                assert!(
-                                    j_stm <= max_active && j_nstm <= max_active,
-                                    "More inputs provided than the specified maximum!"
-                                );
+                                // max_active を超えるレコードは切り詰めて続行する。
+                                // 未使用スロットは -1 で初期化済みなので切り詰め自体は安全。
+                                // ★abort しないのは、数十億局面の中の 1 件で 15 時間の訓練が死ぬのが
+                                //   割に合わないため。ただし**黙って落とさない**: 件数を数えて出す。
+                                //   率が無視できない大きさなら、データでなくデコード側のバグを疑うこと。
+                                if j_stm > max_active || j_nstm > max_active {
+                                    report_feature_overflow(j_stm.max(j_nstm), max_active);
+                                }
 
                                 if O::BUCKETS > 1 {
                                     buckets_chunk[i] = out.bucket(pos) as i32;
@@ -434,20 +466,31 @@ where
                                 inp.map_features_split(pos, |our_opt, opp_opt| {
                                     if let Some(our) = our_opt {
                                         assert!(our < input_size, "STM feature index exceeded input size!");
-                                        stm_chunk[sparse_offset + j_stm] = our as i32;
+                                        // ★境界チェックは書き込みの**前**に行う。溢れてから assert すると、
+                                        //   はみ出した分が隣のレコードの領域を踏んだ後に発覚する
+                                        //   (= 静かなデータ汚染)。
+                                        if j_stm < max_active {
+                                            stm_chunk[sparse_offset + j_stm] = our as i32;
+                                        }
                                         j_stm += 1;
                                     }
                                     if let Some(opp) = opp_opt {
                                         assert!(opp < input_size, "NSTM feature index exceeded input size!");
-                                        nstm_chunk[sparse_offset + j_nstm] = opp as i32;
+                                        if j_nstm < max_active {
+                                            nstm_chunk[sparse_offset + j_nstm] = opp as i32;
+                                        }
                                         j_nstm += 1;
                                     }
                                 });
 
-                                assert!(
-                                    j_stm <= max_active && j_nstm <= max_active,
-                                    "More inputs provided than the specified maximum!"
-                                );
+                                // max_active を超えるレコードは切り詰めて続行する。
+                                // 未使用スロットは -1 で初期化済みなので切り詰め自体は安全。
+                                // ★abort しないのは、数十億局面の中の 1 件で 15 時間の訓練が死ぬのが
+                                //   割に合わないため。ただし**黙って落とさない**: 件数を数えて出す。
+                                //   率が無視できない大きさなら、データでなくデコード側のバグを疑うこと。
+                                if j_stm > max_active || j_nstm > max_active {
+                                    report_feature_overflow(j_stm.max(j_nstm), max_active);
+                                }
 
                                 if O::BUCKETS > 1 {
                                     buckets_chunk[i] = out.bucket(pos) as i32;

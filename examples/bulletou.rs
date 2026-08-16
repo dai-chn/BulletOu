@@ -11544,9 +11544,23 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
         if parts.len() < 12 {
             continue;
         }
-        last_teacher = Some(parts[11].trim().to_string());
+        last_teacher = Some(unquote_csv_field(parts[11].trim()));
     }
     last_teacher
+}
+
+/// learn.log の teacher 列は、値にカンマを含むとき CSV として `"` で囲まれる
+/// (`--teacher a,b,c` は必ずそうなる)。引用符を外さずに `--teacher` の生値と
+/// 比較すると **常に不一致**になり、`teacher_changed` が立って mid-epoch resume が
+/// 黙って無効化される (= 途中再開が「学習済み」と誤判定され、何もせず終了する)。
+/// 2026-08-16 に Phase B の再開で踏んだ。
+fn unquote_csv_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        field[1..field.len() - 1].replace("\"\"", "\"")
+    } else {
+        field.to_string()
+    }
 }
 
 fn upgrade_summary_log_to_current_schema(top: &std::path::Path) -> std::io::Result<()> {
@@ -16325,6 +16339,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_latest_saved_teacher(&tmp), Some("foo.hcpe".to_string()));
+
+        // ★複数 teacher は CSV として引用符で囲まれて記録される。引用符を外して
+        //   `--teacher` の生値と一致させないと teacher_changed が常に立ち、
+        //   mid-epoch resume が黙って無効化される (2026-08-16 の Phase B で実害)。
+        let d2 = tmp.join("0002");
+        std::fs::create_dir(&d2).unwrap();
+        std::fs::write(d2.join("state.bin"), b"state").unwrap();
+        std::fs::write(d2.join("dataloader_pos.txt"), "524288,0\n").unwrap();
+        std::fs::write(
+            d2.join("learn.log"),
+            format!(
+                "{LEARN_LOG_HEADER}\nNNUE_KP-NNUE_kp_256x2_32_32,1,2,32,-,-,0.1,0.001,0.0009,1.000,524288,\"D:\\a,D:\\b\"\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_latest_saved_teacher(&tmp), Some("D:\\a,D:\\b".to_string()));
+        std::fs::remove_dir_all(&d2).unwrap();
 
         // 0004 を追加して bar.hcpe にしたら、最新 dir の teacher が返る
         let d4 = tmp.join("0004");
