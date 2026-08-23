@@ -644,6 +644,11 @@ __global__ void dense_add_bias_kernel(
 constexpr size_t SFNN_HALFKA2_BASE_INPUT_SIZE = 131949;
 constexpr size_t SFNN_HALFKA2_PIECE_INPUTS = 1629;
 constexpr size_t SFNN_HALFKA2_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
+// HalfKA2 + Threat (task#54): レイアウト [KA2 131,949][Threat 216,720][KA virtual 1,629]。
+// virtual rows は KA2 部 (feature < 131,949) のみから射影し、threat 部は factorise しない。
+constexpr size_t SFNN_HALFKA2T_THREAT_DIMENSIONS = 216720;
+constexpr size_t SFNN_HALFKA2T_BASE_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2T_THREAT_DIMENSIONS;
+constexpr size_t SFNN_HALFKA2T_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2T_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
 constexpr float SFNN_PAIRWISE_SCALE = 127.0f / 128.0f;
 
 bool sfnn_is_grouped_l1_shape(size_t l1_group_count) {
@@ -674,6 +679,11 @@ size_t sfnn_l1w_len_for_shape(
 __device__ bool sfnn_factorized_virtual_feature(size_t feature, size_t input_size, size_t* out_feature) {
     if (input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE && feature < SFNN_HALFKA2_BASE_INPUT_SIZE) {
         *out_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + (feature % SFNN_HALFKA2_PIECE_INPUTS);
+        return true;
+    }
+    if (input_size == SFNN_HALFKA2T_FACTORIZED_INPUT_SIZE && feature < SFNN_HALFKA2_BASE_INPUT_SIZE) {
+        // KA2 部のみ virtual row へ (threat 部 131,949..348,669 は factorise しない)
+        *out_feature = SFNN_HALFKA2T_BASE_INPUT_SIZE + (feature % SFNN_HALFKA2_PIECE_INPUTS);
         return true;
     }
     return false;
@@ -2242,7 +2252,12 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
 
 __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     float* l0w_gradients,
-    size_t ft_size) {
+    size_t ft_size,
+    size_t ka_rows,
+    size_t virtual_base) {
+    // virtual row の勾配 = 対応する KA2 base 行 (feature % PIECE_INPUTS が一致) の勾配和。
+    // halfka2:  ka_rows = virtual_base = 131,949
+    // halfka2t: ka_rows = 131,949, virtual_base = 348,669 (threat 行は寄与しない)
     size_t piece = blockIdx.x;
     size_t row = blockIdx.y * blockDim.x + threadIdx.x;
     if (piece >= SFNN_HALFKA2_PIECE_INPUTS || row >= ft_size) {
@@ -2250,10 +2265,10 @@ __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     }
 
     float sum = 0.0f;
-    for (size_t feature = piece; feature < SFNN_HALFKA2_BASE_INPUT_SIZE; feature += SFNN_HALFKA2_PIECE_INPUTS) {
+    for (size_t feature = piece; feature < ka_rows; feature += SFNN_HALFKA2_PIECE_INPUTS) {
         sum += l0w_gradients[feature * ft_size + row];
     }
-    size_t virtual_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + piece;
+    size_t virtual_feature = virtual_base + piece;
     l0w_gradients[virtual_feature * ft_size + row] = sum;
 }
 
@@ -3779,8 +3794,13 @@ int launch_sfnn_inverse_index_l0_backward(
 
     size_t n_features = input_size;
     const bool halfka2_factorized = input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE;
+    const bool halfka2t_factorized = input_size == SFNN_HALFKA2T_FACTORIZED_INPUT_SIZE;
     if (halfka2_factorized) {
         n_features = SFNN_HALFKA2_BASE_INPUT_SIZE;
+    }
+    if (halfka2t_factorized) {
+        // base = KA2 + Threat の全行に scatter し、virtual 行は後段の reduce で決定的に作る
+        n_features = SFNN_HALFKA2T_BASE_INPUT_SIZE;
     }
 
     if (launch_sfnn_inverse_index_for_perspective(
@@ -3806,15 +3826,18 @@ int launch_sfnn_inverse_index_l0_backward(
         return -1;
     }
 
-    if (halfka2_factorized) {
+    if (halfka2_factorized || halfka2t_factorized) {
         constexpr int gather_threads = 128;
         dim3 reduce_grid(
             static_cast<unsigned int>(SFNN_HALFKA2_PIECE_INPUTS),
             static_cast<unsigned int>((ft_size + gather_threads - 1) / gather_threads),
             1);
+        const size_t virtual_base = halfka2t_factorized ? SFNN_HALFKA2T_BASE_INPUT_SIZE : SFNN_HALFKA2_BASE_INPUT_SIZE;
         sfnn_reduce_halfka2_virtual_l0w_gradients_kernel<<<reduce_grid, gather_threads, 0, ctx->stream>>>(
             l0w_gradients,
-            ft_size);
+            ft_size,
+            SFNN_HALFKA2_BASE_INPUT_SIZE,
+            virtual_base);
         if (check_kernel_launch("sfnn_reduce_halfka2_virtual_l0w_gradients_kernel launch") != 0) {
             return -1;
         }

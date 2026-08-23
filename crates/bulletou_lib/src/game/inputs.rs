@@ -11,6 +11,7 @@ mod shogi_halfka_hm_hand_count;
 mod shogi_halfka_hm_hand_threat;
 mod shogi_halfka_hm_hand_threat_defensive;
 mod shogi_halfka_hm_threat;
+mod shogi_halfka2_threat;
 mod shogi_halfkp;
 mod shogi_halfkpe9;
 mod shogi_halfkpvm;
@@ -37,6 +38,9 @@ pub use shogi_halfka_hm_hand_count::{HAND_COUNT_DIMS, ShogiHalfKaHmHandCount};
 pub use shogi_halfka_hm_hand_threat::ShogiHalfKaHmHandThreat;
 pub use shogi_halfka_hm_hand_threat_defensive::ShogiHalfKaHmHandThreatDefensive;
 pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
+pub use shogi_halfka2_threat::{
+    HALFKA2_THREAT_DIMENSIONS, HALFKA2_THREAT_TOTAL_DIMENSIONS, ShogiHalfKa2Threat,
+};
 pub use shogi_halfka_hm1::{FEATURE_HASH_HALFKA_HM1, HALFKA_HM1_DIMENSIONS, ShogiHalfKaHm1};
 pub use shogi_halfka_hm2::{FEATURE_HASH_HALFKA_HM2, HALFKA_HM2_DIMENSIONS, ShogiHalfKaHm2};
 pub use shogi_halfkp::{

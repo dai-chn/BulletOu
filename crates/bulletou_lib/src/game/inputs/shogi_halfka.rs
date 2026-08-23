@@ -519,7 +519,7 @@ fn halfka_nonmirror_index(kb: usize, bp: usize) -> usize {
 // =============================================================================
 
 /// HalfKA2 特徴量インデックスを列挙。
-fn map_halfka2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
+pub(super) fn map_halfka2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     let stm = board.side_to_move;
     let nstm = stm.opponent();
 

@@ -97,13 +97,13 @@ const ATTACKS_PER_COLOR: [usize; NUM_THREAT_CLASSES] = [
 // pair_base テーブル
 // =============================================================================
 
-const NUM_PAIRS: usize = 2 * NUM_THREAT_CLASSES * 2 * NUM_THREAT_CLASSES; // 324
+pub(super) const NUM_PAIRS: usize = 2 * NUM_THREAT_CLASSES * 2 * NUM_THREAT_CLASSES; // 324
 
 /// 除外された pair の sentinel 値
 const EXCLUDED_PAIR_BASE: usize = usize::MAX;
 
 /// 指定された profile で pair_base テーブルと THREAT_DIMENSIONS を構築 (runtime)
-fn build_pair_base(profile: ThreatProfile) -> ([usize; NUM_PAIRS], usize) {
+pub(super) fn build_pair_base(profile: ThreatProfile) -> ([usize; NUM_PAIRS], usize) {
     let mut table = [0usize; NUM_PAIRS];
     let mut cumulative = 0usize;
     for attacker_side in 0..2 {
@@ -677,21 +677,21 @@ pub(super) fn normalize_sq(sq: Square, perspective: Color, hm_mirror: bool) -> S
 // =============================================================================
 
 /// Threat index 計算用のパラメータ
-struct ThreatParams {
-    attacker_side: usize,
-    attacker_class: ThreatClass,
-    oriented_color: Color,
-    attacked_side: usize,
-    attacked_class: ThreatClass,
-    from_sq_n: Square,
-    to_sq_n: Square,
+pub(super) struct ThreatParams {
+    pub(super) attacker_side: usize,
+    pub(super) attacker_class: ThreatClass,
+    pub(super) oriented_color: Color,
+    pub(super) attacked_side: usize,
+    pub(super) attacked_class: ThreatClass,
+    pub(super) from_sq_n: Square,
+    pub(super) to_sq_n: Square,
 }
 
 /// Threat index を計算する。除外された pair は None を返す。
 ///
 /// `attack_order` は O(1) LUT lookup (`ATTACK_ORDER_TABLE`) を使用する。
 #[inline]
-fn threat_index(
+pub(super) fn threat_index(
     params: &ThreatParams,
     pair_base_table: &[usize; NUM_PAIRS],
     from_offset_table: &FromOffsetTable,

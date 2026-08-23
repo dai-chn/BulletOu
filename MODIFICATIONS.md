@@ -107,3 +107,54 @@ WRM 600,0,285,285,2 / decay 0.01 / beta1 0.99) で bullet-shogi (crate 004d) と
 ★004d レシピを BulletOu で再現するときの必須フラグ:
 `--nnue-init bullet-kaiming --optimizer-beta1 0.99 --optimizer-weight-decay 0.01
  --wrm-constants 600 0 285 285 2 --nnue-pytorch-wrm-loss --lambda 1.0`
+
+## HalfKA2+Threat 入力 (SFNN_halfka2t) の追加 (2026-08-22, task#54)
+
+Phase-1 (HalfKP+Threat, 512x2, +140.4 実測) を SFNN アーキに載せるための入力追加。
+レイアウトは `[HalfKA2 131,949][Threat 216,720][KA virtual 1,629]` = 訓練時 350,298 行。
+threat 部は factorise しない (multifactor 劣化 −393.3 の実測に基づく単因子方針)。
+
+- `crates/bulletou_lib/src/game/inputs/shogi_halfka_hm_threat.rs`:
+  bullet-shogi 側と同一の可視性変更 (`pub(super)` 化) のみ。テーブルロジックは
+  upstream と不変 (checksum 0x30f7eea2484893cd で bullet-shogi / YO threat.cpp と一致検証)。
+- `crates/bulletou_lib/src/game/inputs/shogi_halfka2_threat.rs` (新規):
+  `ShogiHalfKa2Threat` (Full profile 固定 unit struct)。KA2 部は `map_halfka2_features`
+  を共有、threat 部は既存テーブルを再利用。tables_checksum + startpos 34 テスト付き。
+- `crates/bulletou_lib/src/game/inputs/shogi_halfka.rs`: `map_halfka2_features` を pub(super) に。
+- `crates/bulletou_lib/src/value/fast_sfnn.rs`: `SFNN_HALFKA2T_*` 定数 +
+  `halfka2_ft_factorized_virtual_feature` に threat 分岐 (KA2 部のみ virtual へ)。
+- `crates/bulletou_lib/src/value/nnue_save.rs`: `NnueFeatureSet::HalfKa2Threat`。
+  hash = `FEATURE_HASH_HALFKA2 ^ 0x54485254 ("THRT") ^ 0 (full)` = 0x0b6b1eec。
+  YO 側 `FeatureSet<Threat, HalfKA2>` は Threat::kHashValue = 0xB52D879C で逆算一致
+  (HalfKP 版 0xB3F22C9C と同じ手順、既知値で検算済)。
+- `crates/cuda_cpp/cpp/bulletou_cuda_backend.cu`: `SFNN_HALFKA2T_*` constexpr、
+  `sfnn_factorized_virtual_feature` に threat 分岐、backward の reduce kernel を
+  (ka_rows, virtual_base) 引数化 (threat 行は virtual 勾配に寄与しない)。
+- `examples/bulletou.rs`: arch `SFNN_halfka2t_<FT>_<H1>_<H2>[_k3k3...]`、
+  `EvalType::SfnnHalfka2Threat` / `CudaCppSfnnFeatureKind::Halfka2Threat`、
+  `ka_base_rows()`、fold を threat-aware 化 (KA2 行のみ virtual 畳み込み)。
+  テスト 4 本 (parse / 次元 / 初期重みレイアウト / fold ミニチュア)。
+
+## `--rescore-psv` モード (2026-08-22, task#56)
+
+threat ラベラ自己蒸留 (report/52 §10) の推論経路。訓練済み SFNN net で PSV shard の
+score を差し替える standalone モード。特徴写像 (`build_sfnn_validation_fast_batch`)・
+fold (`cuda_cpp_sfnn_weights_for_cpu_validation`)・forward (`sfnn_forward_device`) は
+訓練/検証と同一コードを使うため、train/infer パリティが構造的に保たれる。
+
+- `examples/bulletou.rs`: `--rescore-psv <file|dir|list>` + `--rescore-out <dir>` +
+  `run_cuda_cpp_sfnn_rescore` (SFNN 全 feature kind 対応)。
+  cp = round(forward × `--scale`)、±29999 clamp、score 以外の 38 byte は不変。
+  出力は .tmp → rename (アトミック)。
+  使用例:
+  `bulletou --arch SFNN_halfka2t_1024_7_64_k3k3 --backend cuda-cpp --teacher /dev/null      --cuda-cpp-weights-bin <ckpt>/cuda-cpp-direct/weights.bin      --rescore-psv D:/pool/dir --rescore-out D:/pool-rescored --test-batch-size 16384`
+
+### 検証記録 (2026-08-22)
+
+- 10,000 局面 rescore で **score 以外の 38 byte が全件不変**を numpy 照合で確認。
+- 訓練済み sfnn-3way (240sb) の fp32 rescore vs YO (量子化 nn.bin, FV16) 15 局面:
+  大 |cp| で比 1.19±0.03 に収束 = **定数の export 量子化スケール** + 小値の量子化ノイズ。
+  機能的不一致なし。ラベルは訓練単位 (forward×600) が正であり、YO の表示 cp とは
+  規約差 (FV16 で ~1.19 倍) がある — これは既知の FV 較正の話であり rescore のバグではない。
+- スループット: debug ビルド + batch 4096 で 29k pos/s (10k 局面 0.34s)。
+  release + batch 16384 で大幅向上見込み (GPU forward 自体は同じ)。

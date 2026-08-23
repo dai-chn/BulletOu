@@ -61,7 +61,7 @@ use bulletou_lib::value::nnue_save_sfnn1536::{
 };
 use bulletou_lib::{
     game::inputs::{
-        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
+        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKa2Threat, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{
@@ -161,6 +161,8 @@ enum EvalType {
     /// Identical network topology and LayerStacks bucketing as the
     /// other SFNN variants.
     SfnnKa2,
+    /// SFNN + HalfKA2+Threat (task#54)
+    SfnnHalfka2Threat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -602,6 +604,8 @@ enum NnueArchFeature {
     Halfka2,
     Halfkahm1,
     Halfkahm2,
+    /// HalfKA2 + Threat (SFNN 専用, task#54)
+    Halfka2Threat,
 }
 
 impl NnueArch {
@@ -705,13 +709,15 @@ impl NnueArch {
             (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm2) => EvalType::SfnnHalfka2hm,
             (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2) => EvalType::SfnnHalfka2,
             (NnueArchFamily::Sfnn, NnueArchFeature::Ka2) => EvalType::SfnnKa2,
+            (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2Threat) => EvalType::SfnnHalfka2Threat,
             (NnueArchFamily::Nnue, NnueArchFeature::Halfka2)
             | (NnueArchFamily::Nnue, NnueArchFeature::Halfkahm1)
             | (NnueArchFamily::Nnue, NnueArchFeature::Halfkahm2)
             | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkp)
             | (NnueArchFamily::Sfnn, NnueArchFeature::Kp)
             | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpe9)
-            | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpvm) => {
+            | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkpvm)
+            | (NnueArchFamily::Nnue, NnueArchFeature::Halfka2Threat) => {
                 unreachable!("unsupported parsed architecture combination: {self:?}")
             }
         }
@@ -772,6 +778,7 @@ impl NnueArchFeature {
             "halfka2" => NnueArchFeature::Halfka2,
             "halfkahm1" => NnueArchFeature::Halfkahm1,
             "halfkahm2" => NnueArchFeature::Halfkahm2,
+            "halfka2t" => NnueArchFeature::Halfka2Threat,
             _ => return Err(format!("invalid arch `{original}`: unsupported feature `{raw}`")),
         };
 
@@ -786,6 +793,7 @@ impl NnueArchFeature {
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkahm2)
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2)
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Ka2)
+                | (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2Threat)
         );
         if !supported {
             let family_name = match family {
@@ -808,6 +816,7 @@ impl NnueArchFeature {
             NnueArchFeature::Halfka2 => "halfka2",
             NnueArchFeature::Halfkahm1 => "halfkahm1",
             NnueArchFeature::Halfkahm2 => "halfkahm2",
+            NnueArchFeature::Halfka2Threat => "halfka2t",
         }
     }
 }
@@ -1128,6 +1137,7 @@ impl EvalType {
             EvalType::SfnnHalfka2hm => "shogi_sfnn_halfka2hm",
             EvalType::SfnnHalfka2 => "shogi_sfnn_halfka2",
             EvalType::SfnnKa2 => "shogi_sfnn_ka2",
+            EvalType::SfnnHalfka2Threat => "shogi_sfnn_halfka2threat",
         }
     }
 
@@ -1146,7 +1156,8 @@ impl EvalType {
             | EvalType::SfnnHalfka1hm
             | EvalType::SfnnHalfka2hm
             | EvalType::SfnnHalfka2
-            | EvalType::SfnnKa2 => true,
+            | EvalType::SfnnKa2
+            | EvalType::SfnnHalfka2Threat => true,
         }
     }
 
@@ -1158,7 +1169,14 @@ impl EvalType {
     /// (LayerStacks-based architectures) does; the rest of the NNUE family
     /// is single-stack.
     fn uses_layerstack(self) -> bool {
-        matches!(self, EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2)
+        matches!(
+            self,
+            EvalType::SfnnHalfka1hm
+                | EvalType::SfnnHalfka2hm
+                | EvalType::SfnnHalfka2
+                | EvalType::SfnnKa2
+                | EvalType::SfnnHalfka2Threat
+        )
     }
 
     /// Stable internal target name used in output directories, logs, and
@@ -1177,6 +1195,7 @@ impl EvalType {
             EvalType::SfnnHalfka2hm => "SFNN_HALFKA2HM",
             EvalType::SfnnHalfka2 => "SFNN_HALFKA2",
             EvalType::SfnnKa2 => "SFNN_KA2",
+            EvalType::SfnnHalfka2Threat => "SFNN_HALFKA2T",
         }
     }
 
@@ -2296,6 +2315,19 @@ struct Args {
     #[arg(long)]
     cuda_cpp_weights_bin: Option<PathBuf>,
 
+    /// Rescore mode (task#56): PSV shard file/dir/comma-list to relabel with the
+    /// trained SFNN net's eval. Each record's score is replaced by
+    /// `round(forward_output * --scale)` (clamped to +-29999); all other record
+    /// fields are preserved byte-for-byte. Requires an SFNN --arch,
+    /// --backend cuda-cpp, and --cuda-cpp-weights-bin (checkpoint weights.bin).
+    /// Uses the exact training-side feature mapping = no train/infer mismatch.
+    #[arg(long)]
+    rescore_psv: Option<String>,
+
+    /// Output directory for rescored PSV shards (same file names as inputs).
+    #[arg(long)]
+    rescore_out: Option<PathBuf>,
+
     /// Temporary Windows-native C++/CUDA direct-trainer batch count.
     /// This currently runs NNUE_HALFKP fixed-layout train steps without
     /// production checkpoint/resume orchestration.
@@ -2848,6 +2880,7 @@ impl Args {
                 | EvalType::SfnnHalfka2hm
                 | EvalType::SfnnHalfka2
                 | EvalType::SfnnKa2
+                | EvalType::SfnnHalfka2Threat
         ) {
             return Err(format!("--backend cuda-cpp does not support {} train steps", eval_type.cli_name()));
         }
@@ -3401,6 +3434,25 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    // `--rescore-psv` operates standalone (no training): relabel the supplied
+    // PSV shards with the trained SFNN net and exit.
+    if args.rescore_psv.is_some() {
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            match run_cuda_cpp_sfnn_rescore(&args) {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("error: --rescore-psv failed: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: --rescore-psv requires the cuda-cpp-backend build");
+            std::process::exit(2);
+        }
+    }
     if !(args.optimizer_weight_decay.is_finite() && args.optimizer_weight_decay >= 0.0) {
         eprintln!("error: --optimizer-weight-decay must be finite and >= 0.");
         std::process::exit(2);
@@ -3620,6 +3672,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
                 EvalType::SfnnHalfka2hm => run_cuda_cpp_sfnn_halfka2hm_direct_steps(args),
                 EvalType::SfnnHalfka2 => run_cuda_cpp_sfnn_halfka2_direct_steps(args),
                 EvalType::SfnnKa2 => run_cuda_cpp_sfnn_ka2_direct_steps(args),
+                EvalType::SfnnHalfka2Threat => run_cuda_cpp_sfnn_halfka2threat_direct_steps(args),
             };
         }
 
@@ -3908,6 +3961,7 @@ enum CudaCppSfnnFeatureKind {
     Halfka2hm,
     Halfka2,
     Ka2,
+    Halfka2Threat,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -3918,6 +3972,7 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2hm => "SFNN_HALFKA2HM",
             Self::Halfka2 => "SFNN_HALFKA2",
             Self::Ka2 => "SFNN_KA2",
+            Self::Halfka2Threat => "SFNN_HALFKA2T",
         }
     }
 
@@ -3927,6 +3982,7 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2hm => "HalfKA_hm2",
             Self::Halfka2 => "HalfKA2",
             Self::Ka2 => "KA2",
+            Self::Halfka2Threat => "HalfKA2Threat",
         }
     }
 
@@ -3936,6 +3992,7 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2hm => "halfkahm2",
             Self::Halfka2 => "halfka2",
             Self::Ka2 => "ka2",
+            Self::Halfka2Threat => "halfka2threat",
         }
     }
 
@@ -3945,6 +4002,7 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2hm => NnueFeatureSet::HalfKaHm2,
             Self::Halfka2 => NnueFeatureSet::HalfKa2,
             Self::Ka2 => NnueFeatureSet::Ka2,
+            Self::Halfka2Threat => NnueFeatureSet::HalfKa2Threat,
         }
     }
 
@@ -3954,12 +4012,15 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2hm => ShogiHalfKaHm2.num_inputs(),
             Self::Halfka2 => ShogiHalfKa2.num_inputs(),
             Self::Ka2 => ShogiKa2.num_inputs(),
+            Self::Halfka2Threat => ShogiHalfKa2Threat.num_inputs(),
         }
     }
 
     fn virtual_rows(self) -> usize {
         match self {
-            Self::Halfka2 => bulletou_lib::game::inputs::PIECE_INPUTS,
+            // Halfka2Threat も KA2 部の factorise 用に同じ virtual rows を持つ
+            // (threat 部は factorise しない — virtual row への射影は KA2 部のみ)
+            Self::Halfka2 | Self::Halfka2Threat => bulletou_lib::game::inputs::PIECE_INPUTS,
             Self::Halfka1hm | Self::Halfka2hm | Self::Ka2 => 0,
         }
     }
@@ -3968,12 +4029,23 @@ impl CudaCppSfnnFeatureKind {
         self.base_input_size() + self.virtual_rows()
     }
 
+    /// virtual rows の射影元になる行数 (= KA2 部の次元)。
+    /// Halfka2 は base 全体、Halfka2Threat は KA2 部 (threat 行は射影しない)。
+    fn ka_base_rows(self) -> usize {
+        match self {
+            Self::Halfka2 => ShogiHalfKa2.num_inputs(),
+            Self::Halfka2Threat => bulletou_lib::game::inputs::HALFKA2_DIMENSIONS,
+            Self::Halfka1hm | Self::Halfka2hm | Self::Ka2 => 0,
+        }
+    }
+
     fn max_active(self) -> usize {
         match self {
             Self::Halfka1hm => ShogiHalfKaHm1.max_active(),
             Self::Halfka2hm => ShogiHalfKaHm2.max_active(),
             Self::Halfka2 => ShogiHalfKa2.max_active(),
             Self::Ka2 => ShogiKa2.max_active(),
+            Self::Halfka2Threat => ShogiHalfKa2Threat.max_active(),
         }
     }
 }
@@ -5917,6 +5989,9 @@ where
         CudaCppSfnnFeatureKind::Ka2 => {
             for_each_sfnn_teacher_fast_batch(ShogiKa2, feature_kind.input_label(), config, batch_count, visitor)
         }
+        CudaCppSfnnFeatureKind::Halfka2Threat => {
+            for_each_sfnn_teacher_fast_batch(ShogiHalfKa2Threat, feature_kind.input_label(), config, batch_count, visitor)
+        }
     }
     .map_err(|e| e.to_string())
 }
@@ -5934,6 +6009,11 @@ fn run_cuda_cpp_sfnn_halfka2hm_direct_steps(args: &Args) -> Result<(), String> {
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_sfnn_halfka2_direct_steps(args: &Args) -> Result<(), String> {
     run_cuda_cpp_sfnn_direct_steps(args, CudaCppSfnnFeatureKind::Halfka2)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_halfka2threat_direct_steps(args: &Args) -> Result<(), String> {
+    run_cuda_cpp_sfnn_direct_steps(args, CudaCppSfnnFeatureKind::Halfka2Threat)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7138,6 +7218,202 @@ fn run_cuda_cpp_nnue_final_validation(
     Ok(Some(metrics))
 }
 
+/// `--rescore-psv` 本体 (task#56): 訓練済み SFNN net で PSV shard を再ラベルする。
+/// 特徴写像・fold・forward は訓練/検証と同一経路 (train/infer パリティを構造的に保証)。
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_rescore(args: &Args) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let feature_kind = match args.eval_type() {
+        EvalType::SfnnHalfka1hm => CudaCppSfnnFeatureKind::Halfka1hm,
+        EvalType::SfnnHalfka2hm => CudaCppSfnnFeatureKind::Halfka2hm,
+        EvalType::SfnnHalfka2 => CudaCppSfnnFeatureKind::Halfka2,
+        EvalType::SfnnKa2 => CudaCppSfnnFeatureKind::Ka2,
+        EvalType::SfnnHalfka2Threat => CudaCppSfnnFeatureKind::Halfka2Threat,
+        other => {
+            return Err(format!("--rescore-psv requires an SFNN arch, got {}", other.cli_name()));
+        }
+    };
+    let rescore_psv = args.rescore_psv.as_deref().expect("dispatch guarantees rescore_psv");
+    let out_dir = args
+        .rescore_out
+        .as_deref()
+        .ok_or_else(|| "--rescore-psv requires --rescore-out <dir>".to_string())?;
+    let weights_path = args
+        .cuda_cpp_weights_bin
+        .as_deref()
+        .ok_or_else(|| "--rescore-psv requires --cuda-cpp-weights-bin (checkpoint weights.bin)".to_string())?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
+
+    // 重みロード → factorizer/virtual rows を fold して forward 用 CPU 重みへ
+    let state = load_cuda_cpp_sfnn_initial_state(weights_path, args, feature_kind)?;
+    let w = state.weights;
+    let shape = w.shape;
+    let readback = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+        l0w: w.l0w,
+        l0b: w.l0b,
+        l1w: w.l1w,
+        l1b: w.l1b,
+        l1fw: w.l1fw,
+        l1fb: w.l1fb,
+        l1axw: w.l1axw,
+        l1axb: w.l1axb,
+        l2w: w.l2w,
+        l2b: w.l2b,
+        l2fw: w.l2fw,
+        l2fb: w.l2fb,
+        l2axw: w.l2axw,
+        l2axb: w.l2axb,
+        l3w: w.l3w,
+        l3b: w.l3b,
+        l3fw: w.l3fw,
+        l3fb: w.l3fb,
+        l3axw: w.l3axw,
+        l3axb: w.l3axb,
+    };
+    let factorizer = effective_sfnn_factorizer_spec(args);
+    let validation_weights = cuda_cpp_sfnn_weights_for_cpu_validation(feature_kind, shape, &readback, factorizer)?;
+    let validation_shape = bulletou_cuda_cpp::SfnnForwardShape {
+        input_size: validation_weights.shape.input_size,
+        ft_size: validation_weights.shape.ft_size,
+        l1_hidden: validation_weights.shape.l1_hidden,
+        l2_size: validation_weights.shape.l2_size,
+        num_stacks: validation_weights.shape.num_stacks,
+        l1_group_count: validation_weights.shape.l1_group_count,
+        l1_common_size: 0,
+        l1_shard_size: 0,
+        factorizer_king_axis_dim: shape.factorizer_king_axis_dim,
+        factorizer_hand_axis_dim: shape.factorizer_hand_axis_dim,
+    };
+    let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
+    let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(
+        &ctx,
+        bulletou_cuda_cpp::SfnnForwardHostWeights {
+            shape: validation_shape,
+            l0w: &validation_weights.l0w,
+            l0b: &validation_weights.l0b,
+            l1w: &validation_weights.l1w,
+            l1b: &validation_weights.l1b,
+            l1fw: None,
+            l1fb: None,
+            l1axw: None,
+            l1axb: None,
+            l2w: &validation_weights.l2w,
+            l2b: &validation_weights.l2b,
+            l2fw: None,
+            l2fb: None,
+            l2axw: None,
+            l2axb: None,
+            l3w: &validation_weights.l3w,
+            l3b: &validation_weights.l3b,
+            l3fw: None,
+            l3fb: None,
+            l3axw: None,
+            l3axb: None,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    let batch_size = args.test_batch_size.max(1);
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+    let scale = args.scale as f32;
+    const PSV_BYTES: usize = 40;
+
+    let paths = bulletou_lib::teacher_path::expand_teacher(rescore_psv)?;
+    if paths.is_empty() {
+        return Err(format!("--rescore-psv {rescore_psv} matched no files"));
+    }
+    let started = std::time::Instant::now();
+    let mut total_positions = 0usize;
+    for (file_index, path) in paths.iter().enumerate() {
+        let src = Path::new(path);
+        let bytes = std::fs::read(src).map_err(|e| format!("failed to read {path}: {e}"))?;
+        if bytes.len() % PSV_BYTES != 0 {
+            return Err(format!("{path}: size {} is not a multiple of {PSV_BYTES} (not raw PSV?)", bytes.len()));
+        }
+        let mut records: Vec<bulletou_lib::shogi::PackedSfenValue> = Vec::with_capacity(bytes.len() / PSV_BYTES);
+        for chunk in bytes.chunks_exact(PSV_BYTES) {
+            let mut rec = bulletou_lib::shogi::PackedSfenValue::default();
+            rec.as_bytes_mut().copy_from_slice(chunk);
+            records.push(rec);
+        }
+
+        let mut scores: Vec<i16> = Vec::with_capacity(records.len());
+        for positions in records.chunks(batch_size) {
+            let batch = build_sfnn_validation_fast_batch(feature_kind, layerstack, positions)?;
+            let device_batch = bulletou_cuda_cpp::SfnnForwardDeviceBatch::from_host(
+                &ctx,
+                bulletou_cuda_cpp::SfnnForwardHostBatch {
+                    stm_indices: &batch.stm,
+                    nstm_indices: &batch.nstm,
+                    buckets: &batch.buckets,
+                    batch_size: batch.layout.batch_size,
+                    max_active: batch.layout.max_active,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let workspace = bulletou_cuda_cpp::SfnnForwardWorkspace::new(
+                &ctx,
+                bulletou_cuda_cpp::SfnnForwardWorkspaceLayout::new(validation_shape, batch.layout.batch_size),
+            )
+            .map_err(|e| e.to_string())?;
+            bulletou_cuda_cpp::sfnn_forward_device(&ctx, &device_batch, &device_weights, &workspace)
+                .map_err(|e| e.to_string())?;
+            let outputs = workspace.download_output(&ctx).map_err(|e| e.to_string())?;
+            for out in outputs {
+                // cp = forward 出力 × scale。mate 帯 (|cp|>=30000) を避けて ±29999 に clamp。
+                let cp = (out * scale).round();
+                scores.push(cp.clamp(-29999.0, 29999.0) as i16);
+            }
+        }
+        if scores.len() != records.len() {
+            return Err(format!(
+                "{path}: rescored {} of {} records (internal batch mismatch)",
+                scores.len(),
+                records.len()
+            ));
+        }
+        for (rec, &score) in records.iter_mut().zip(scores.iter()) {
+            rec.as_bytes_mut()[32..34].copy_from_slice(&score.to_le_bytes());
+        }
+
+        let file_name = src
+            .file_name()
+            .ok_or_else(|| format!("{path}: cannot determine file name"))?;
+        let dst = out_dir.join(file_name);
+        let tmp = out_dir.join(format!("{}.tmp", file_name.to_string_lossy()));
+        {
+            let mut writer = std::io::BufWriter::new(
+                std::fs::File::create(&tmp).map_err(|e| format!("failed to create {}: {e}", tmp.display()))?,
+            );
+            for rec in &records {
+                writer.write_all(rec.as_bytes()).map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+            }
+            writer.flush().map_err(|e| format!("failed to flush {}: {e}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, &dst)
+            .map_err(|e| format!("failed to rename {} -> {}: {e}", tmp.display(), dst.display()))?;
+
+        total_positions += records.len();
+        let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "  rescore [{}/{}] {} ({} pos, cumulative {:.0} pos/s)",
+            file_index + 1,
+            paths.len(),
+            dst.display(),
+            records.len(),
+            if elapsed > 0.0 { total_positions as f64 / elapsed } else { 0.0 }
+        );
+    }
+    eprintln!(
+        "rescore complete: files={} positions={} elapsed={}",
+        paths.len(),
+        total_positions,
+        format_duration_secs(started.elapsed())
+    );
+    Ok(())
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_sfnn_final_validation(
     args: &Args,
@@ -7643,7 +7919,7 @@ fn cuda_cpp_sfnn_weights_for_cpu_validation(
     let l0w = if shape.input_size == base_input_size {
         weights.l0w.clone()
     } else if virtual_rows > 0 && shape.input_size == factorized_input_size {
-        fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?
+        fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, feature_kind.ka_base_rows(), virtual_rows, shape.ft_size)?
     } else {
         return Err(format!(
             "cannot validate cuda-cpp {} SFNN weights with input_size={}, expected {} or factorized {}",
@@ -8237,6 +8513,13 @@ fn build_sfnn_validation_fast_batch(
             )?,
             CudaCppSfnnFeatureKind::Halfka2 => fill_sparse_validation_features(
                 ShogiHalfKa2,
+                feature_kind.source_label(),
+                pos,
+                &mut stm[sparse_offset..sparse_offset + max_active],
+                &mut nstm[sparse_offset..sparse_offset + max_active],
+            )?,
+            CudaCppSfnnFeatureKind::Halfka2Threat => fill_sparse_validation_features(
+                ShogiHalfKa2Threat,
                 feature_kind.source_label(),
                 pos,
                 &mut stm[sparse_offset..sparse_offset + max_active],
@@ -9665,7 +9948,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         &weights.l0w
     } else if virtual_rows > 0 {
         folded_l0w =
-            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?;
+            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, feature_kind.ka_base_rows(), virtual_rows, shape.ft_size)?;
         &folded_l0w
     } else {
         return Err(format!(
@@ -9959,6 +10242,7 @@ fn fold_halfkp_piece_factorized_l0w(
 fn fold_sfnn_halfka2_piece_factorized_l0w(
     weights: &[f32],
     base_input_size: usize,
+    ka_rows: usize,
     virtual_rows: usize,
     ft_size: usize,
 ) -> Result<Vec<f32>, String> {
@@ -9972,13 +10256,24 @@ fn fold_sfnn_halfka2_piece_factorized_l0w(
     if weights.len() != expected {
         return Err(format!("factorized SFNN HalfKA2 l0w length mismatch: expected {expected}, got {}", weights.len()));
     }
+    if ka_rows > base_input_size {
+        return Err(format!(
+            "factorized SFNN HalfKA2 l0w fold: ka_rows={ka_rows} exceeds base_input_size={base_input_size}"
+        ));
+    }
     let mut folded = vec![0.0_f32; base_input_size * ft_size];
     for row in 0..base_input_size {
-        let virtual_row = base_input_size + row % virtual_rows;
         let base_start = row * ft_size;
-        let virtual_start = virtual_row * ft_size;
-        for col in 0..ft_size {
-            folded[base_start + col] = weights[base_start + col] + weights[virtual_start + col];
+        if row < ka_rows {
+            // KA2 部: virtual row (piece 因子) を畳み込む
+            let virtual_row = base_input_size + row % virtual_rows;
+            let virtual_start = virtual_row * ft_size;
+            for col in 0..ft_size {
+                folded[base_start + col] = weights[base_start + col] + weights[virtual_start + col];
+            }
+        } else {
+            // threat 部: factorise していないのでそのままコピー
+            folded[base_start..base_start + ft_size].copy_from_slice(&weights[base_start..base_start + ft_size]);
         }
     }
     Ok(folded)
@@ -14482,6 +14777,92 @@ mod tests {
         assert_eq!(&weights.l1b[..l1_out], &weights.l1b[l1_out..2 * l1_out]);
     }
 
+    /// task#54: SFNN_halfka2t (HalfKA2+Threat) の arch parse / eval type / 次元
+    #[test]
+    fn sfnn_halfka2t_arch_parse_and_dims() {
+        use std::str::FromStr as _;
+        let arch = NnueArch::from_str("SFNN_halfka2t_1024_7_64_k3k3").unwrap();
+        assert_eq!(arch.cli_name(), "SFNN_halfka2t_1024_7_64_k3k3");
+        assert_eq!(arch.expected_eval_type(), EvalType::SfnnHalfka2Threat);
+        assert_eq!(arch.dims(), (1024, 7, 64));
+        // NNUE family では拒否される
+        assert!(NnueArch::from_str("NNUE_halfka2t_512x2_16_32").is_err());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_halfka2threat_feature_kind_dims() {
+        let kind = CudaCppSfnnFeatureKind::Halfka2Threat;
+        // base = KA2 131,949 + Threat 216,720 = 348,669 / virtual = KA2 piece 1,629
+        assert_eq!(kind.base_input_size(), 348_669);
+        assert_eq!(kind.virtual_rows(), bulletou_lib::game::inputs::PIECE_INPUTS);
+        assert_eq!(kind.training_input_size(), 350_298);
+        assert_eq!(kind.ka_base_rows(), bulletou_lib::game::inputs::HALFKA2_DIMENSIONS);
+        assert_eq!(kind.feature_set(), NnueFeatureSet::HalfKa2Threat);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_halfka2threat_initial_weights_layout() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2t_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+
+        let weights =
+            build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Halfka2Threat).unwrap();
+        let base_input_size = ShogiHalfKa2Threat.num_inputs();
+        let virtual_rows = bulletou_lib::game::inputs::PIECE_INPUTS;
+        assert_eq!(weights.shape.input_size, base_input_size + virtual_rows);
+        // base 行 (KA2+Threat) は乱数初期化、virtual 行はゼロ初期化
+        assert!(weights.l0w[..base_input_size * weights.shape.ft_size].iter().any(|&v| v != 0.0));
+        assert!(weights.l0w[base_input_size * weights.shape.ft_size..].iter().all(|&v| v == 0.0));
+        // threat 部の行も乱数初期化されていること (KA2 部だけでなく)
+        let threat_start = bulletou_lib::game::inputs::HALFKA2_DIMENSIONS * weights.shape.ft_size;
+        let threat_end = base_input_size * weights.shape.ft_size;
+        assert!(weights.l0w[threat_start..threat_end].iter().any(|&v| v != 0.0));
+    }
+
+    /// task#54: threat-aware fold — KA2 行のみ virtual を畳み、threat 行は素通し
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn fold_sfnn_halfka2threat_l0w_folds_only_ka_rows() {
+        let ka_rows = 4usize;      // ミニチュア: KA2 部 4 行
+        let threat_rows = 3usize;  // threat 部 3 行
+        let virtual_rows = 2usize; // piece 因子 2 行
+        let base = ka_rows + threat_rows;
+        let ft = 2usize;
+        // 重み: base 行 r は値 (r+1)、virtual 行 v は値 100*(v+1)
+        let mut w = Vec::new();
+        for r in 0..base {
+            w.extend(std::iter::repeat((r + 1) as f32).take(ft));
+        }
+        for v in 0..virtual_rows {
+            w.extend(std::iter::repeat(100.0 * (v + 1) as f32).take(ft));
+        }
+        let folded = fold_sfnn_halfka2_piece_factorized_l0w(&w, base, ka_rows, virtual_rows, ft).unwrap();
+        assert_eq!(folded.len(), base * ft);
+        // KA2 行: r % virtual_rows の virtual 値が足される
+        for r in 0..ka_rows {
+            let expect = (r + 1) as f32 + 100.0 * ((r % virtual_rows) + 1) as f32;
+            assert_eq!(folded[r * ft], expect);
+        }
+        // threat 行: 変化なし
+        for r in ka_rows..base {
+            assert_eq!(folded[r * ft], (r + 1) as f32);
+        }
+    }
+
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn cuda_cpp_sfnn_initial_weights_can_disable_factorized() {
@@ -15040,7 +15421,7 @@ mod tests {
             20.0, 21.0, 22.0, // virtual piece 1
         ];
 
-        let folded = fold_sfnn_halfka2_piece_factorized_l0w(&weights, base_input_size, virtual_rows, ft_size).unwrap();
+        let folded = fold_sfnn_halfka2_piece_factorized_l0w(&weights, base_input_size, base_input_size, virtual_rows, ft_size).unwrap();
 
         assert_eq!(
             folded,
