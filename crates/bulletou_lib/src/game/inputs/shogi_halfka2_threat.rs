@@ -298,6 +298,27 @@ mod tests {
         assert_eq!(th, 34);
     }
 
+
+    #[test]
+    fn test_dump_gold_faceoff_indices() {
+        // 金当たり局面: 白金(4,4) 黒金(4,5) 王(4,0)/(4,8)。cross-side ペアの照合用 dump。
+        use crate::shogi::types::Piece;
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+        board.board[Square::new(4, 4).index()] = Piece::new(Color::White, PieceType::Gold);
+        board.board[Square::new(4, 5).index()] = Piece::new(Color::Black, PieceType::Gold);
+        let mut pairs = Vec::new();
+        ShogiHalfKa2Threat.map_threat_only(&board, |s, n| pairs.push((s, n)));
+        pairs.sort_unstable();
+        println!("GOLD_FACEOFF_DUMP {:?}", pairs);
+    }
+
     #[test]
     fn test_startpos_symmetry() {
         // 初期局面は先後対称なので、STM/NSTM の threat index 集合は一致するはず
@@ -312,5 +333,28 @@ mod tests {
         stm_set.sort_unstable();
         nstm_set.sort_unstable();
         assert_eq!(stm_set, nstm_set);
+    }
+}
+
+#[cfg(test)]
+mod dump_env_tests {
+    use super::*;
+    use crate::shogi::{PackedSfenValue, ShogiBoard};
+
+    /// THREAT_DUMP_PSV=<psv> で全レコードの threat index (stm/nstm, ソート済) を出力する
+    /// (bullet-shogi 側の同名テストとの cross-crate 突き合わせ用)。
+    #[test]
+    fn dump_threat_indices_env() {
+        let Ok(path) = std::env::var("THREAT_DUMP_PSV") else { return; };
+        let bytes = std::fs::read(&path).expect("read psv");
+        for (i, rec) in bytes.chunks_exact(40).enumerate() {
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut().copy_from_slice(rec);
+            let board = ShogiBoard::from_packed_sfen(&psv);
+            let (mut s, mut n) = (Vec::new(), Vec::new());
+            ShogiHalfKa2Threat.map_threat_only(&board, |a, b| { s.push(a); n.push(b); });
+            s.sort_unstable(); n.sort_unstable();
+            println!("R{} S:{:?} N:{:?}", i, s, n);
+        }
     }
 }
