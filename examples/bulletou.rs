@@ -2328,6 +2328,16 @@ struct Args {
     #[arg(long)]
     rescore_out: Option<PathBuf>,
 
+    /// Export-only mode (task#65): load --cuda-cpp-weights-bin (checkpoint state) and write the YO
+    /// nn.bin to this path without training. Uses --sfnn-l1-qb for the fc_0 weight scale.
+    #[arg(long)]
+    export_nn: Option<PathBuf>,
+
+    /// fc_0 (L1) int8 weight scale for SFNN nn.bin export (default 64 = legacy). 128 halves the
+    /// rounding step; YO must be built with -DNNUE_SFNN_L1_SCALE_BITS=7 to read it (report/51 §7.7).
+    #[arg(long, default_value_t = 64)]
+    sfnn_l1_qb: i16,
+
     /// Temporary Windows-native C++/CUDA direct-trainer batch count.
     /// This currently runs NNUE_HALFKP fixed-layout train steps without
     /// production checkpoint/resume orchestration.
@@ -3436,6 +3446,23 @@ fn main() {
     }
     // `--rescore-psv` operates standalone (no training): relabel the supplied
     // PSV shards with the trained SFNN net and exit.
+    if args.export_nn.is_some() {
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            match run_cuda_cpp_sfnn_export(&args) {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("error: --export-nn failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: --export-nn requires the cuda-cpp-backend build");
+            std::process::exit(1);
+        }
+    }
     if args.rescore_psv.is_some() {
         #[cfg(feature = "cuda-cpp-backend")]
         {
@@ -7218,6 +7245,59 @@ fn run_cuda_cpp_nnue_final_validation(
     Ok(Some(metrics))
 }
 
+/// `--export-nn` (task#65): checkpoint state を読み、訓練せずに YO nn.bin を書き出す。
+/// `--sfnn-l1-qb` で fc_0 の int8 スケールを変えられる (YO 側は NNUE_SFNN_L1_SCALE_BITS を合わせる)。
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_export(args: &Args) -> Result<(), String> {
+    let feature_kind = match args.eval_type() {
+        EvalType::SfnnHalfka1hm => CudaCppSfnnFeatureKind::Halfka1hm,
+        EvalType::SfnnHalfka2hm => CudaCppSfnnFeatureKind::Halfka2hm,
+        EvalType::SfnnHalfka2 => CudaCppSfnnFeatureKind::Halfka2,
+        EvalType::SfnnKa2 => CudaCppSfnnFeatureKind::Ka2,
+        EvalType::SfnnHalfka2Threat => CudaCppSfnnFeatureKind::Halfka2Threat,
+        other => {
+            return Err(format!("--rescore-psv requires an SFNN arch, got {}", other.cli_name()));
+        }
+    };
+    let out = args.export_nn.as_deref().expect("dispatch guarantees export_nn");
+    let weights_path = args
+        .cuda_cpp_weights_bin
+        .as_deref()
+        .ok_or_else(|| "--export-nn requires --cuda-cpp-weights-bin (checkpoint state.bin/weights.bin)".to_string())?;
+    let state = load_cuda_cpp_sfnn_initial_state(weights_path, args, feature_kind)?;
+    let w = state.weights;
+    let shape = w.shape;
+    let readback = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+        l0w: w.l0w,
+        l0b: w.l0b,
+        l1w: w.l1w,
+        l1b: w.l1b,
+        l1fw: w.l1fw,
+        l1fb: w.l1fb,
+        l1axw: w.l1axw,
+        l1axb: w.l1axb,
+        l2w: w.l2w,
+        l2b: w.l2b,
+        l2fw: w.l2fw,
+        l2fb: w.l2fb,
+        l2axw: w.l2axw,
+        l2axb: w.l2axb,
+        l3w: w.l3w,
+        l3b: w.l3b,
+        l3fw: w.l3fw,
+        l3fb: w.l3fb,
+        l3axw: w.l3axw,
+        l3axb: w.l3axb,
+    };
+    let factorizer = effective_sfnn_factorizer_spec(args);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    write_cuda_cpp_sfnn_nn_bin(out, feature_kind, shape, &readback, factorizer, None, args.sfnn_l1_qb)?;
+    println!("exported {} (sfnn_l1_qb={})", out.display(), args.sfnn_l1_qb);
+    Ok(())
+}
+
 /// `--rescore-psv` 本体 (task#56): 訓練済み SFNN net で PSV shard を再ラベルする。
 /// 特徴写像・fold・forward は訓練/検証と同一経路 (train/infer パリティを構造的に保証)。
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7740,6 +7820,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
         weights,
         effective_sfnn_factorizer_spec(args),
         progress_params,
+            SFNN_QB,
     )?;
     write_cuda_cpp_sfnn_weights_bin(&dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
     write_cuda_cpp_direct_checkpoint_metadata(&output_dir, idx, &dir, args, log)?;
@@ -9731,7 +9812,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
-    write_cuda_cpp_sfnn_nn_bin(&dir.join("nn.bin"), feature_kind, shape, weights, factorizer, progress_params)?;
+    write_cuda_cpp_sfnn_nn_bin(&dir.join("nn.bin"), feature_kind, shape, weights, factorizer, progress_params, SFNN_QB)?;
     write_cuda_cpp_sfnn_weights_bin(&dir.join("weights.bin"), weights, optimizer_states, completed_steps)
 }
 
@@ -9927,6 +10008,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     factorizer: SfnnFactorizerSpec,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
+    l1_qb: i16,
 ) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -9995,6 +10077,9 @@ fn write_cuda_cpp_sfnn_nn_bin(
     let l2_in = shape.l2_in();
     let fc_bias_scale = f32::from(SFNN_QA) * f32::from(SFNN_QB);
     let fc_weight_scale = f32::from(SFNN_QB);
+    // L1 (fc_0) だけ別スケール (task#65: QB=64 では小さい重みが 0 に丸められる)
+    let l1_bias_scale = f32::from(SFNN_QA) * f32::from(l1_qb);
+    let l1_weight_scale = f32::from(l1_qb);
     let use_axis = factorizer.king_axis || factorizer.hand_axis;
     let compact_l1 = cuda_cpp_sfnn_is_compact_l1_shape(shape);
     let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
@@ -10046,6 +10131,18 @@ fn write_cuda_cpp_sfnn_nn_bin(
         l1axb,
         factorizer,
     )?;
+    {
+        let mut mags: Vec<f32> = l1w_for_export.iter().map(|v| v.abs()).collect();
+        mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = mags.len().max(1);
+        let half_step = 0.5 / f32::from(l1_qb);
+        let zeroed = mags.iter().filter(|&&m| m < half_step).count();
+        let clipped = mags.iter().filter(|&&m| m * f32::from(l1_qb) > 127.5).count();
+        eprintln!(
+            "sfnn export l1w stats: n={} median|w|={:.4} p90={:.4} max={:.3} frac_rounds_to_zero(qb={})={:.3} clipped={}",
+            n, mags[n / 2], mags[(n * 9) / 10], mags[n - 1], l1_qb, zeroed as f64 / n as f64, clipped
+        );
+    }
     let mut l2w_for_export = weights.l2w.clone();
     let mut l2b_for_export = weights.l2b.clone();
     let mut l3w_for_export = weights.l3w.clone();
@@ -10077,7 +10174,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         let mut l1b_bytes = Vec::with_capacity(l1_out * std::mem::size_of::<i32>());
         for out_col in 0..l1_out {
             let value = l1b_for_export[stack * l1_out + out_col];
-            l1b_bytes.extend_from_slice(&sfnn_quantise_i32(value, fc_bias_scale).to_le_bytes());
+            l1b_bytes.extend_from_slice(&sfnn_quantise_i32(value, l1_bias_scale).to_le_bytes());
         }
         write_nnue_bin_chunk(&mut writer, path, "sfnn l1b", &l1b_bytes)?;
 
@@ -10087,7 +10184,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
             for in_col in 0..l1_pad_in {
                 let q = if in_col < shape.ft_size {
                     let value = l1w_for_export[stack * l1_out * shape.ft_size + out_col * shape.ft_size + in_col];
-                    sfnn_quantise_i8(value, fc_weight_scale)
+                    sfnn_quantise_i8(value, l1_weight_scale)
                 } else {
                     0
                 };
