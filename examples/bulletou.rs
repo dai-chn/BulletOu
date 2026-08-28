@@ -61,7 +61,7 @@ use bulletou_lib::value::nnue_save_sfnn1536::{
 };
 use bulletou_lib::{
     game::inputs::{
-        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKa2Threat, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
+        ShogiHalfKP, ShogiHalfKPvm, ShogiHalfKa2, ShogiHalfKa2Threat, ShogiHalfKa2ThreatDropFact, ShogiHalfKaHm1, ShogiHalfKaHm2, ShogiHalfKpe9, ShogiKa2, ShogiKk,
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{
@@ -163,6 +163,8 @@ enum EvalType {
     SfnnKa2,
     /// SFNN + HalfKA2+Threat (task#54)
     SfnnHalfka2Threat,
+    /// SFNN + HalfKA2+Threat + threat from-drop factoriser (task#70)
+    SfnnHalfka2ThreatDropFact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -606,6 +608,9 @@ enum NnueArchFeature {
     Halfkahm2,
     /// HalfKA2 + Threat (SFNN 専用, task#54)
     Halfka2Threat,
+    /// HalfKA2 + Threat + threat from-drop factoriser (SFNN 専用, task#70)。
+    /// export は Halfka2Threat と同一 (hash / 次元 / description 不変)
+    Halfka2ThreatDropFact,
 }
 
 impl NnueArch {
@@ -710,7 +715,9 @@ impl NnueArch {
             (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2) => EvalType::SfnnHalfka2,
             (NnueArchFamily::Sfnn, NnueArchFeature::Ka2) => EvalType::SfnnKa2,
             (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2Threat) => EvalType::SfnnHalfka2Threat,
-            (NnueArchFamily::Nnue, NnueArchFeature::Halfka2)
+            (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2ThreatDropFact) => EvalType::SfnnHalfka2ThreatDropFact,
+            (NnueArchFamily::Nnue, NnueArchFeature::Halfka2ThreatDropFact)
+            | (NnueArchFamily::Nnue, NnueArchFeature::Halfka2)
             | (NnueArchFamily::Nnue, NnueArchFeature::Halfkahm1)
             | (NnueArchFamily::Nnue, NnueArchFeature::Halfkahm2)
             | (NnueArchFamily::Sfnn, NnueArchFeature::Halfkp)
@@ -779,6 +786,7 @@ impl NnueArchFeature {
             "halfkahm1" => NnueArchFeature::Halfkahm1,
             "halfkahm2" => NnueArchFeature::Halfkahm2,
             "halfka2t" => NnueArchFeature::Halfka2Threat,
+            "halfka2tdf" => NnueArchFeature::Halfka2ThreatDropFact,
             _ => return Err(format!("invalid arch `{original}`: unsupported feature `{raw}`")),
         };
 
@@ -794,6 +802,7 @@ impl NnueArchFeature {
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2)
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Ka2)
                 | (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2Threat)
+                | (NnueArchFamily::Sfnn, NnueArchFeature::Halfka2ThreatDropFact)
         );
         if !supported {
             let family_name = match family {
@@ -817,6 +826,7 @@ impl NnueArchFeature {
             NnueArchFeature::Halfkahm1 => "halfkahm1",
             NnueArchFeature::Halfkahm2 => "halfkahm2",
             NnueArchFeature::Halfka2Threat => "halfka2t",
+            NnueArchFeature::Halfka2ThreatDropFact => "halfka2tdf",
         }
     }
 }
@@ -1138,6 +1148,7 @@ impl EvalType {
             EvalType::SfnnHalfka2 => "shogi_sfnn_halfka2",
             EvalType::SfnnKa2 => "shogi_sfnn_ka2",
             EvalType::SfnnHalfka2Threat => "shogi_sfnn_halfka2threat",
+            EvalType::SfnnHalfka2ThreatDropFact => "shogi_sfnn_halfka2threatdropfact",
         }
     }
 
@@ -1157,7 +1168,8 @@ impl EvalType {
             | EvalType::SfnnHalfka2hm
             | EvalType::SfnnHalfka2
             | EvalType::SfnnKa2
-            | EvalType::SfnnHalfka2Threat => true,
+            | EvalType::SfnnHalfka2Threat
+            | EvalType::SfnnHalfka2ThreatDropFact => true,
         }
     }
 
@@ -1176,6 +1188,7 @@ impl EvalType {
                 | EvalType::SfnnHalfka2
                 | EvalType::SfnnKa2
                 | EvalType::SfnnHalfka2Threat
+                | EvalType::SfnnHalfka2ThreatDropFact
         )
     }
 
@@ -1196,6 +1209,7 @@ impl EvalType {
             EvalType::SfnnHalfka2 => "SFNN_HALFKA2",
             EvalType::SfnnKa2 => "SFNN_KA2",
             EvalType::SfnnHalfka2Threat => "SFNN_HALFKA2T",
+            EvalType::SfnnHalfka2ThreatDropFact => "SFNN_HALFKA2TDF",
         }
     }
 
@@ -2891,6 +2905,7 @@ impl Args {
                 | EvalType::SfnnHalfka2
                 | EvalType::SfnnKa2
                 | EvalType::SfnnHalfka2Threat
+                | EvalType::SfnnHalfka2ThreatDropFact
         ) {
             return Err(format!("--backend cuda-cpp does not support {} train steps", eval_type.cli_name()));
         }
@@ -3700,6 +3715,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
                 EvalType::SfnnHalfka2 => run_cuda_cpp_sfnn_halfka2_direct_steps(args),
                 EvalType::SfnnKa2 => run_cuda_cpp_sfnn_ka2_direct_steps(args),
                 EvalType::SfnnHalfka2Threat => run_cuda_cpp_sfnn_halfka2threat_direct_steps(args),
+                EvalType::SfnnHalfka2ThreatDropFact => run_cuda_cpp_sfnn_halfka2threatdropfact_direct_steps(args),
             };
         }
 
@@ -3989,6 +4005,9 @@ enum CudaCppSfnnFeatureKind {
     Halfka2,
     Ka2,
     Halfka2Threat,
+    /// task#70: Halfka2Threat + threat from-drop factoriser。訓練時の行は
+    /// [KA2][Threat][KA virtual 1,629][Lite virtual 26,244] = 376,542、export は Halfka2Threat と同一 348,669 行
+    Halfka2ThreatDropFact,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -4000,6 +4019,7 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2 => "SFNN_HALFKA2",
             Self::Ka2 => "SFNN_KA2",
             Self::Halfka2Threat => "SFNN_HALFKA2T",
+            Self::Halfka2ThreatDropFact => "SFNN_HALFKA2TDF",
         }
     }
 
@@ -4010,6 +4030,7 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2 => "HalfKA2",
             Self::Ka2 => "KA2",
             Self::Halfka2Threat => "HalfKA2Threat",
+            Self::Halfka2ThreatDropFact => "HalfKA2ThreatDropFact",
         }
     }
 
@@ -4020,26 +4041,29 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2 => "halfka2",
             Self::Ka2 => "ka2",
             Self::Halfka2Threat => "halfka2threat",
+            Self::Halfka2ThreatDropFact => "halfka2threatdropfact",
         }
     }
 
+    /// ★Halfka2ThreatDropFact も HalfKa2Threat を返す: export (fold 後) は同一の nn.bin 形式
     fn feature_set(self) -> NnueFeatureSet {
         match self {
             Self::Halfka1hm => NnueFeatureSet::HalfKaHm1,
             Self::Halfka2hm => NnueFeatureSet::HalfKaHm2,
             Self::Halfka2 => NnueFeatureSet::HalfKa2,
             Self::Ka2 => NnueFeatureSet::Ka2,
-            Self::Halfka2Threat => NnueFeatureSet::HalfKa2Threat,
+            Self::Halfka2Threat | Self::Halfka2ThreatDropFact => NnueFeatureSet::HalfKa2Threat,
         }
     }
 
+    /// export される行数 (nn.bin の description にも使われる)。Halfka2ThreatDropFact は 348,669 のまま
     fn base_input_size(self) -> usize {
         match self {
             Self::Halfka1hm => ShogiHalfKaHm1.num_inputs(),
             Self::Halfka2hm => ShogiHalfKaHm2.num_inputs(),
             Self::Halfka2 => ShogiHalfKa2.num_inputs(),
             Self::Ka2 => ShogiKa2.num_inputs(),
-            Self::Halfka2Threat => ShogiHalfKa2Threat.num_inputs(),
+            Self::Halfka2Threat | Self::Halfka2ThreatDropFact => ShogiHalfKa2Threat.num_inputs(),
         }
     }
 
@@ -4048,6 +4072,10 @@ impl CudaCppSfnnFeatureKind {
             // Halfka2Threat も KA2 部の factorise 用に同じ virtual rows を持つ
             // (threat 部は factorise しない — virtual row への射影は KA2 部のみ)
             Self::Halfka2 | Self::Halfka2Threat => bulletou_lib::game::inputs::PIECE_INPUTS,
+            // KA virtual 1,629 + Lite virtual 26,244 (lite は CPU 側で明示 emit)
+            Self::Halfka2ThreatDropFact => {
+                bulletou_lib::game::inputs::PIECE_INPUTS + bulletou_lib::game::inputs::HALFKA2_THREAT_LITE_DIMENSIONS
+            }
             Self::Halfka1hm | Self::Halfka2hm | Self::Ka2 => 0,
         }
     }
@@ -4061,7 +4089,7 @@ impl CudaCppSfnnFeatureKind {
     fn ka_base_rows(self) -> usize {
         match self {
             Self::Halfka2 => ShogiHalfKa2.num_inputs(),
-            Self::Halfka2Threat => bulletou_lib::game::inputs::HALFKA2_DIMENSIONS,
+            Self::Halfka2Threat | Self::Halfka2ThreatDropFact => bulletou_lib::game::inputs::HALFKA2_DIMENSIONS,
             Self::Halfka1hm | Self::Halfka2hm | Self::Ka2 => 0,
         }
     }
@@ -4073,7 +4101,31 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2 => ShogiHalfKa2.max_active(),
             Self::Ka2 => ShogiKa2.max_active(),
             Self::Halfka2Threat => ShogiHalfKa2Threat.max_active(),
+            Self::Halfka2ThreatDropFact => ShogiHalfKa2ThreatDropFact.max_active(),
         }
+    }
+}
+
+/// feature kind に応じた l0w の fold (訓練時の仮想行込み → export の base 行)。
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_sfnn_l0w_for_kind(feature_kind: CudaCppSfnnFeatureKind, l0w: &[f32], ft_size: usize) -> Result<Vec<f32>, String> {
+    match feature_kind {
+        CudaCppSfnnFeatureKind::Halfka2ThreatDropFact => fold_sfnn_halfka2_threat_dropfact_l0w(
+            l0w,
+            feature_kind.base_input_size(),
+            feature_kind.ka_base_rows(),
+            bulletou_lib::game::inputs::PIECE_INPUTS,
+            bulletou_lib::game::inputs::HALFKA2_THREAT_LITE_DIMENSIONS,
+            ft_size,
+            bulletou_lib::game::inputs::threat_full_to_lite,
+        ),
+        _ => fold_sfnn_halfka2_piece_factorized_l0w(
+            l0w,
+            feature_kind.base_input_size(),
+            feature_kind.ka_base_rows(),
+            feature_kind.virtual_rows(),
+            ft_size,
+        ),
     }
 }
 
@@ -6019,8 +6071,20 @@ where
         CudaCppSfnnFeatureKind::Halfka2Threat => {
             for_each_sfnn_teacher_fast_batch(ShogiHalfKa2Threat, feature_kind.input_label(), config, batch_count, visitor)
         }
+        CudaCppSfnnFeatureKind::Halfka2ThreatDropFact => for_each_sfnn_teacher_fast_batch(
+            ShogiHalfKa2ThreatDropFact,
+            feature_kind.input_label(),
+            config,
+            batch_count,
+            visitor,
+        ),
     }
     .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_cuda_cpp_sfnn_halfka2threatdropfact_direct_steps(args: &Args) -> Result<(), String> {
+    run_cuda_cpp_sfnn_direct_steps(args, CudaCppSfnnFeatureKind::Halfka2ThreatDropFact)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -7255,6 +7319,7 @@ fn run_cuda_cpp_sfnn_export(args: &Args) -> Result<(), String> {
         EvalType::SfnnHalfka2 => CudaCppSfnnFeatureKind::Halfka2,
         EvalType::SfnnKa2 => CudaCppSfnnFeatureKind::Ka2,
         EvalType::SfnnHalfka2Threat => CudaCppSfnnFeatureKind::Halfka2Threat,
+        EvalType::SfnnHalfka2ThreatDropFact => CudaCppSfnnFeatureKind::Halfka2ThreatDropFact,
         other => {
             return Err(format!("--rescore-psv requires an SFNN arch, got {}", other.cli_name()));
         }
@@ -7310,6 +7375,7 @@ fn run_cuda_cpp_sfnn_rescore(args: &Args) -> Result<(), String> {
         EvalType::SfnnHalfka2 => CudaCppSfnnFeatureKind::Halfka2,
         EvalType::SfnnKa2 => CudaCppSfnnFeatureKind::Ka2,
         EvalType::SfnnHalfka2Threat => CudaCppSfnnFeatureKind::Halfka2Threat,
+        EvalType::SfnnHalfka2ThreatDropFact => CudaCppSfnnFeatureKind::Halfka2ThreatDropFact,
         other => {
             return Err(format!("--rescore-psv requires an SFNN arch, got {}", other.cli_name()));
         }
@@ -8000,7 +8066,7 @@ fn cuda_cpp_sfnn_weights_for_cpu_validation(
     let l0w = if shape.input_size == base_input_size {
         weights.l0w.clone()
     } else if virtual_rows > 0 && shape.input_size == factorized_input_size {
-        fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, feature_kind.ka_base_rows(), virtual_rows, shape.ft_size)?
+        fold_sfnn_l0w_for_kind(feature_kind, &weights.l0w, shape.ft_size)?
     } else {
         return Err(format!(
             "cannot validate cuda-cpp {} SFNN weights with input_size={}, expected {} or factorized {}",
@@ -8568,7 +8634,8 @@ fn build_sfnn_validation_fast_batch(
         return Err(format!("{} SFNN validation batch must not be empty", feature_kind.source_label()));
     }
     let max_active = feature_kind.max_active();
-    let input_size = feature_kind.base_input_size();
+    // dropfact は lite virtual index (≥ base) を CPU 側で emit するので、上限は訓練時の行数
+    let input_size = feature_kind.training_input_size();
     let sparse_len = batch_size
         .checked_mul(max_active)
         .ok_or_else(|| format!("{} SFNN validation sparse batch length overflow", feature_kind.source_label()))?;
@@ -8601,6 +8668,13 @@ fn build_sfnn_validation_fast_batch(
             )?,
             CudaCppSfnnFeatureKind::Halfka2Threat => fill_sparse_validation_features(
                 ShogiHalfKa2Threat,
+                feature_kind.source_label(),
+                pos,
+                &mut stm[sparse_offset..sparse_offset + max_active],
+                &mut nstm[sparse_offset..sparse_offset + max_active],
+            )?,
+            CudaCppSfnnFeatureKind::Halfka2ThreatDropFact => fill_sparse_validation_features(
+                ShogiHalfKa2ThreatDropFact,
                 feature_kind.source_label(),
                 pos,
                 &mut stm[sparse_offset..sparse_offset + max_active],
@@ -10030,7 +10104,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         &weights.l0w
     } else if virtual_rows > 0 {
         folded_l0w =
-            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, feature_kind.ka_base_rows(), virtual_rows, shape.ft_size)?;
+            fold_sfnn_l0w_for_kind(feature_kind, &weights.l0w, shape.ft_size)?;
         &folded_l0w
     } else {
         return Err(format!(
@@ -10374,6 +10448,56 @@ fn fold_sfnn_halfka2_piece_factorized_l0w(
         } else {
             // threat 部: factorise していないのでそのままコピー
             folded[base_start..base_start + ft_size].copy_from_slice(&weights[base_start..base_start + ft_size]);
+        }
+    }
+    Ok(folded)
+}
+
+/// task#70: HalfKA2+Threat+dropfact の fold。
+/// 行レイアウト [KA2 ka_rows][Threat][KA virtual ka_virtual_rows][Lite virtual lite_rows]。
+/// KA2 行 r には `w[base + r % ka_virtual_rows]`、threat 行 t には `w[base + ka_virtual_rows + full_to_lite(t)]` を足す。
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_sfnn_halfka2_threat_dropfact_l0w(
+    weights: &[f32],
+    base_input_size: usize,
+    ka_rows: usize,
+    ka_virtual_rows: usize,
+    lite_rows: usize,
+    ft_size: usize,
+    full_to_lite: impl Fn(usize) -> usize,
+) -> Result<Vec<f32>, String> {
+    let total_rows = base_input_size + ka_virtual_rows + lite_rows;
+    let expected = total_rows.checked_mul(ft_size).ok_or_else(|| {
+        format!("factorized SFNN HalfKA2ThreatDropFact l0w shape overflow: rows={total_rows} ft_size={ft_size}")
+    })?;
+    if weights.len() != expected {
+        return Err(format!(
+            "factorized SFNN HalfKA2ThreatDropFact l0w length mismatch: expected {expected}, got {}",
+            weights.len()
+        ));
+    }
+    if ka_rows > base_input_size || ka_virtual_rows == 0 {
+        return Err(format!(
+            "factorized SFNN HalfKA2ThreatDropFact fold: ka_rows={ka_rows} base={base_input_size} ka_virtual_rows={ka_virtual_rows}"
+        ));
+    }
+    let ka_virtual_base = base_input_size;
+    let lite_virtual_base = base_input_size + ka_virtual_rows;
+    let mut folded = vec![0.0_f32; base_input_size * ft_size];
+    for row in 0..base_input_size {
+        let base_start = row * ft_size;
+        let virtual_row = if row < ka_rows {
+            ka_virtual_base + row % ka_virtual_rows
+        } else {
+            let lite = full_to_lite(row - ka_rows);
+            if lite >= lite_rows {
+                return Err(format!("full_to_lite({}) = {lite} exceeds lite_rows={lite_rows}", row - ka_rows));
+            }
+            lite_virtual_base + lite
+        };
+        let virtual_start = virtual_row * ft_size;
+        for col in 0..ft_size {
+            folded[base_start + col] = weights[base_start + col] + weights[virtual_start + col];
         }
     }
     Ok(folded)
@@ -14961,6 +15085,66 @@ mod tests {
         for r in ka_rows..base {
             assert_eq!(folded[r * ft], (r + 1) as f32);
         }
+    }
+
+    /// task#70: SFNN_halfka2tdf (dropfact) の arch parse / 次元 / レイアウト
+    #[test]
+    fn sfnn_halfka2tdf_arch_parse() {
+        use std::str::FromStr as _;
+        let arch = NnueArch::from_str("SFNN_halfka2tdf_1024_7_64_k3k3").unwrap();
+        assert_eq!(arch.cli_name(), "SFNN_halfka2tdf_1024_7_64_k3k3");
+        assert_eq!(arch.expected_eval_type(), EvalType::SfnnHalfka2ThreatDropFact);
+        assert!(NnueArch::from_str("NNUE_halfka2tdf_512x2_16_32").is_err());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_halfka2tdf_feature_kind_dims() {
+        let kind = CudaCppSfnnFeatureKind::Halfka2ThreatDropFact;
+        assert_eq!(kind.base_input_size(), 348_669);
+        assert_eq!(kind.virtual_rows(), 1_629 + 26_244);
+        assert_eq!(kind.training_input_size(), 376_542);
+        assert_eq!(kind.training_input_size(), bulletou_lib::game::inputs::HALFKA2T_DROPFACT_TOTAL_DIMENSIONS);
+        assert_eq!(kind.ka_base_rows(), bulletou_lib::game::inputs::HALFKA2_DIMENSIONS);
+        assert_eq!(kind.feature_set(), NnueFeatureSet::HalfKa2Threat);
+        assert_eq!(kind.max_active(), 680);
+        // export 側の base は Halfka2Threat と同一 (nn.bin 互換)
+        assert_eq!(kind.base_input_size(), CudaCppSfnnFeatureKind::Halfka2Threat.base_input_size());
+    }
+
+    /// task#70: dropfact fold — KA2 行は KA virtual、threat 行は lite virtual を畳む
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn fold_sfnn_halfka2tdf_l0w_folds_ka_and_lite() {
+        let ka_rows = 4usize;
+        let threat_rows = 5usize;
+        let ka_virtual = 2usize;
+        let lite_rows = 3usize;
+        let base = ka_rows + threat_rows;
+        let ft = 2usize;
+        let mut w = Vec::new();
+        for r in 0..base {
+            w.extend(std::iter::repeat((r + 1) as f32).take(ft));
+        }
+        for v in 0..ka_virtual {
+            w.extend(std::iter::repeat(100.0 * (v + 1) as f32).take(ft));
+        }
+        for l in 0..lite_rows {
+            w.extend(std::iter::repeat(1000.0 * (l + 1) as f32).take(ft));
+        }
+        let full_to_lite = |t: usize| t % lite_rows;
+        let folded =
+            fold_sfnn_halfka2_threat_dropfact_l0w(&w, base, ka_rows, ka_virtual, lite_rows, ft, full_to_lite).unwrap();
+        assert_eq!(folded.len(), base * ft);
+        for r in 0..ka_rows {
+            assert_eq!(folded[r * ft], (r + 1) as f32 + 100.0 * ((r % ka_virtual) + 1) as f32);
+        }
+        for r in ka_rows..base {
+            let t = r - ka_rows;
+            assert_eq!(folded[r * ft], (r + 1) as f32 + 1000.0 * ((t % lite_rows) + 1) as f32);
+        }
+        // 長さ不一致は拒否
+        assert!(fold_sfnn_halfka2_threat_dropfact_l0w(&w[..w.len() - ft], base, ka_rows, ka_virtual, lite_rows, ft, full_to_lite).is_err());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

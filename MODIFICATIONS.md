@@ -158,3 +158,20 @@ fold (`cuda_cpp_sfnn_weights_for_cpu_validation`)・forward (`sfnn_forward_devic
   規約差 (FV16 で ~1.19 倍) がある — これは既知の FV 較正の話であり rescore のバグではない。
 - スループット: debug ビルド + batch 4096 で 29k pos/s (10k 局面 0.34s)。
   release + batch 16384 で大幅向上見込み (GPU forward 自体は同じ)。
+
+## 2026-08-29: HalfKA2+Threat + threat from-drop factoriser (`SFNN_halfka2tdf_*`, task#70)
+
+classic threat-512 で from-drop factoriser が full に +43.7 有意 (shogi-nnue report/52 §18.2) だったので、王者 halfka2t にも移植した。
+
+- `crates/bulletou_lib/src/game/inputs/shogi_halfka2_threat_dropfact.rs` (新規): `ShogiHalfKa2ThreatDropFact`。
+  full threat index → lite (from-drop, `pair*81 + to`, 26,244 次元) の対応表を bullet-shogi `ShogiPThreatDrop` と同じ走査で構築し、
+  threat 1 件ごとに lite 仮想 index (`350,298 + full_to_lite[t]`) を **CPU 側で明示 emit** する (重複そのまま = count 意味論)。
+  訓練時の行レイアウトは `[KA2 131,949][Threat 216,720][KA virtual 1,629][Lite virtual 26,244]` = 376,542、`max_active` = 680。
+- `crates/bulletou_lib/src/value/fast_sfnn.rs`: `SFNN_HALFKA2TDF_FT_FACTORIZED_INPUT_SIZE` と CPU 参照 forward の分岐 (暗黙 virtual は KA2 部のみ)。
+- `crates/cuda_cpp/cpp/bulletou_cuda_backend.cu`: `SFNN_HALFKA2TDF_FACTORIZED_INPUT_SIZE`、`sfnn_factorized_virtual_feature` の分岐、
+  inverse-index backward で lite 行は通常 gather (n_features = 全行)、KA virtual の reduce は halfka2t と同じ base で実行。新 kernel 無し。
+- `examples/bulletou.rs`: arch 名 `halfka2tdf`、`EvalType::SfnnHalfka2ThreatDropFact`、`CudaCppSfnnFeatureKind::Halfka2ThreatDropFact`
+  (`base_input_size` は 348,669 のまま = nn.bin の hash / 次元 / description は halfka2t と同一)、
+  `fold_sfnn_halfka2_threat_dropfact_l0w` (KA2 行 += KA virtual、threat 行 += lite virtual)、検証バッチの上限を訓練行数に。
+- 検証: lib/example テスト、bullet-shogi `ShogiHalfKPThreatLite` との lite index 多重集合照合 400 局面一致 (重複 561 件含む)。
+- ビルド注意: .cu を再コンパイルする環境では `NVCC_APPEND_FLAGS=-allow-unsupported-compiler` (上記参照)。
