@@ -10042,13 +10042,16 @@ fn write_cuda_cpp_sfnn_nn_bin(
 
     let file = std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
     let mut writer = std::io::BufWriter::new(file);
+    // 末尾の ";L1QB=<qb>/i8" は fc_0 の量子化タグ。YO (evaluate_nnue.cpp QuantTag) がビルドの
+    // -DNNUE_SFNN_L1_SCALE_BITS と照合する (ハッシュには現れないため)。
     let arch = format!(
-        "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}}}",
+        "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}}};L1QB={}/i8",
         feature_set.display_name(),
         base_input_size,
         shape.ft_size,
         shape.ft_size,
-        shape.num_stacks
+        shape.num_stacks,
+        l1_qb
     );
     let sfnn_hash = if progress_params.is_some() { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
     writer
