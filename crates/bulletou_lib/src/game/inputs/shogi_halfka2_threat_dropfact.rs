@@ -319,4 +319,29 @@ mod dump_env_tests {
             println!("R{} S:{:?} N:{:?}", i, s, n);
         }
     }
+
+    /// 飢え診断用 (task#43/#70 検死): THREAT_FREQ_PSV の全局面について full threat index
+    /// (両視点) の出現回数を数え、u32 LE × 216,720 を THREAT_FREQ_OUT へ書く。
+    #[test]
+    fn dump_threat_full_freq_env() {
+        let Ok(path) = std::env::var("THREAT_FREQ_PSV") else { return; };
+        let out = std::env::var("THREAT_FREQ_OUT").expect("THREAT_FREQ_OUT を設定すること");
+        let bytes = std::fs::read(&path).expect("read psv");
+        let mut counts = vec![0u32; HALFKA2_THREAT_DIMENSIONS];
+        for rec in bytes.chunks_exact(40) {
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut().copy_from_slice(rec);
+            let board = ShogiBoard::from_packed_sfen(&psv);
+            ShogiHalfKa2ThreatDropFact.map_threat_and_lite(&board, |s, n, _, _| {
+                counts[s] += 1;
+                counts[n] += 1;
+            });
+        }
+        let mut buf = Vec::with_capacity(counts.len() * 4);
+        for c in &counts {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        std::fs::write(&out, buf).expect("write freq");
+        println!("THREAT_FREQ_OK positions={} out={}", bytes.len() / 40, out);
+    }
 }
