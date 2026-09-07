@@ -57,6 +57,11 @@ pub enum NnueFeatureSet {
     /// YO 側は `FeatureSet<Threat, HalfKA2>` の合成式から Threat::kHashValue を
     /// 逆算する (= 0xB52D879C。threat.h の HalfKP 版 0xB3F22C9C と同じ手順)。
     HalfKa2Threat,
+    /// HalfKA2+ThreatEffect — HalfKA2 に ThreatEffect (長/短利き数バケット, 26,244) を連結した
+    /// 合成特徴 (158,193 次元)。SFNN_halfka2te_* の入力 (task#73 王者移植)。hash は bullet 慣習
+    /// `FEATURE_HASH_HALFKA2 ^ "TEF2"(0x54454632)` = 0x0B660A8A。
+    /// YO 側は `FeatureSet<ThreatEffectKa2, HalfKA2>` の合成式から逆算 (= 0xB52093FA)。
+    HalfKa2ThreatEffect,
     /// K-A2(Friend) — YaneuraOu `FeatureSet<K, A2>` (`SFNN_ka2_*`)。
     /// K (玉 2 個, 162 次元) + A2 (玉含む全駒, 後手玉を自玉 plane に collapse, 1629 次元)
     /// = 1791 次元 / perspective。
@@ -77,6 +82,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKaHm1 => FEATURE_HASH_HALFKA_HM1,
             NnueFeatureSet::HalfKaHm2 => FEATURE_HASH_HALFKA_HM2,
             NnueFeatureSet::HalfKa2Threat => FEATURE_HASH_HALFKA2 ^ 0x5448_5254,
+            NnueFeatureSet::HalfKa2ThreatEffect => FEATURE_HASH_HALFKA2 ^ 0x5445_4632,
             NnueFeatureSet::Ka2 => FEATURE_HASH_KA2,
         }
     }
@@ -94,6 +100,7 @@ impl NnueFeatureSet {
             NnueFeatureSet::HalfKaHm1 => 76_950,
             NnueFeatureSet::HalfKaHm2 => 73_305,
             NnueFeatureSet::HalfKa2Threat => 348_669,
+            NnueFeatureSet::HalfKa2ThreatEffect => 158_193,
             NnueFeatureSet::Ka2 => 1_791,
         }
     }
@@ -120,6 +127,7 @@ impl NnueFeatureSet {
             // FeatureSet<K, A2>::GetName() = "K+A2" (feature_set.h の "+" 結合) だが、
             // K-P と同じく description では (Friend) suffix を付ける。
             NnueFeatureSet::HalfKa2Threat => "HalfKA2Threat(Friend)",
+            NnueFeatureSet::HalfKa2ThreatEffect => "HalfKA2ThreatEffect(Friend)",
             NnueFeatureSet::Ka2 => "K-A2(Friend)",
         }
     }

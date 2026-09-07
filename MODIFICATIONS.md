@@ -175,3 +175,20 @@ classic threat-512 で from-drop factoriser が full に +43.7 有意 (shogi-nnu
   `fold_sfnn_halfka2_threat_dropfact_l0w` (KA2 行 += KA virtual、threat 行 += lite virtual)、検証バッチの上限を訓練行数に。
 - 検証: lib/example テスト、bullet-shogi `ShogiHalfKPThreatLite` との lite index 多重集合照合 400 局面一致 (重複 561 件含む)。
 - ビルド注意: .cu を再コンパイルする環境では `NVCC_APPEND_FLAGS=-allow-unsupported-compiler` (上記参照)。
+
+## 2026-09-07: HalfKA2+ThreatEffect (`SFNN_halfka2te_*`, task#73 王者移植)
+
+classic 512 で ThreatEffect (長/短利き数バケット、26,244 次元) が threat lite/full と互角 (shogi-nnue report/52 §18.10.1、L30 +2.9)
+かつ YO 側で列挙なし差分更新できるので、王者 SFNN halfka2 に連結した。
+
+- `crates/bulletou_lib/src/game/inputs/shogi_halfka2_threat_effect.rs` (新規): `ShogiHalfKa2ThreatEffect`。
+  KA2 部は `ShogiHalfKa2` と同一 index、effect 部は bullet-shogi `ShogiHalfKPThreatEffect` (crate 004z) と同一の index 式・利き定義
+  (攻撃側は玉含む、長い利き = 香/角/飛の射程 + 馬斜め + 龍縦横、集合意味論で (0,0) も emit)。総次元 158,193、`max_active` = KA2 + 80。
+- `crates/bulletou_lib/src/value/nnue_save.rs`: `NnueFeatureSet::HalfKa2ThreatEffect` (hash = `FEATURE_HASH_HALFKA2 ^ "TEF2"(0x54454632)` = 0x0B660A8A、
+  description 名 `HalfKA2ThreatEffect(Friend)`)。
+- `crates/bulletou_lib/src/value/fast_sfnn.rs` / `crates/cuda_cpp/cpp/bulletou_cuda_backend.cu`: 訓練行 `[KA2 131,949][Effect 26,244][KA virtual 1,629]` = 159,822 の
+  レイアウト定数と、暗黙 virtual 射影 (KA2 部のみ) / backward reduce の分岐。新 kernel 無し。
+- `examples/bulletou.rs`: arch 名 `halfka2te`、`EvalType::SfnnHalfka2ThreatEffect`、`CudaCppSfnnFeatureKind::Halfka2ThreatEffect`
+  (fold は halfka2t と同じ KA virtual のみ)、export/rescore/検証バッチの分岐、テスト 2 本。
+- 検証: lib テスト (初期局面 76 特徴・重複なし・先後対称・利き数 canonical)、YO `THREAT_EFFECT_DUMP` ビルドとの index 多重集合照合は
+  訓練チェーン (smoke 後) で実施。

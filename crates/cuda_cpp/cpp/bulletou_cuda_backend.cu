@@ -656,6 +656,11 @@ constexpr size_t SFNN_HALFKA2T_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2T_BASE_INPUT_
 // lite 行も通常の inverse-index gather で勾配が作られる (n_features は全行)。
 constexpr size_t SFNN_HALFKA2T_LITE_DIMENSIONS = 26244;
 constexpr size_t SFNN_HALFKA2TDF_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2T_FACTORIZED_INPUT_SIZE + SFNN_HALFKA2T_LITE_DIMENSIONS;
+// HalfKA2 + ThreatEffect (task#73 王者移植): レイアウト [KA2 131,949][ThreatEffect 26,244][KA virtual 1,629] = 159,822。
+// virtual rows は KA2 部のみから射影し、effect 部は factorise しない (halfka2t と同じ扱い)。
+constexpr size_t SFNN_HALFKA2TE_EFFECT_DIMENSIONS = 26244;
+constexpr size_t SFNN_HALFKA2TE_BASE_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2TE_EFFECT_DIMENSIONS;
+constexpr size_t SFNN_HALFKA2TE_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2TE_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
 constexpr float SFNN_PAIRWISE_SCALE = 127.0f / 128.0f;
 
 bool sfnn_is_grouped_l1_shape(size_t l1_group_count) {
@@ -693,6 +698,11 @@ __device__ bool sfnn_factorized_virtual_feature(size_t feature, size_t input_siz
         // KA2 部のみ virtual row へ (threat 部 131,949..348,669 は factorise しない。
         // dropfact の lite virtual は sparse index に明示されているので射影対象外)
         *out_feature = SFNN_HALFKA2T_BASE_INPUT_SIZE + (feature % SFNN_HALFKA2_PIECE_INPUTS);
+        return true;
+    }
+    if (input_size == SFNN_HALFKA2TE_FACTORIZED_INPUT_SIZE && feature < SFNN_HALFKA2_BASE_INPUT_SIZE) {
+        // HalfKA2+ThreatEffect: KA2 部のみ virtual row へ (effect 部 131,949..158,193 は factorise しない)
+        *out_feature = SFNN_HALFKA2TE_BASE_INPUT_SIZE + (feature % SFNN_HALFKA2_PIECE_INPUTS);
         return true;
     }
     return false;
@@ -3805,12 +3815,17 @@ int launch_sfnn_inverse_index_l0_backward(
     const bool halfka2_factorized = input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE;
     const bool halfka2t_factorized = input_size == SFNN_HALFKA2T_FACTORIZED_INPUT_SIZE;
     const bool halfka2tdf_factorized = input_size == SFNN_HALFKA2TDF_FACTORIZED_INPUT_SIZE;
+    const bool halfka2te_factorized = input_size == SFNN_HALFKA2TE_FACTORIZED_INPUT_SIZE;
     if (halfka2_factorized) {
         n_features = SFNN_HALFKA2_BASE_INPUT_SIZE;
     }
     if (halfka2t_factorized) {
         // base = KA2 + Threat の全行に scatter し、virtual 行は後段の reduce で決定的に作る
         n_features = SFNN_HALFKA2T_BASE_INPUT_SIZE;
+    }
+    if (halfka2te_factorized) {
+        // halfka2t と同じ: base = KA2 + ThreatEffect の全行に scatter、KA virtual は reduce で作る
+        n_features = SFNN_HALFKA2TE_BASE_INPUT_SIZE;
     }
     // halfka2tdf: lite virtual 行 (350,298..376,542) は sparse index に実在するので全行 gather
     // (n_features = input_size のまま)。KA virtual 行 (348,669..350,298) は index に現れないので
@@ -3839,14 +3854,16 @@ int launch_sfnn_inverse_index_l0_backward(
         return -1;
     }
 
-    if (halfka2_factorized || halfka2t_factorized || halfka2tdf_factorized) {
+    if (halfka2_factorized || halfka2t_factorized || halfka2tdf_factorized || halfka2te_factorized) {
         constexpr int gather_threads = 128;
         dim3 reduce_grid(
             static_cast<unsigned int>(SFNN_HALFKA2_PIECE_INPUTS),
             static_cast<unsigned int>((ft_size + gather_threads - 1) / gather_threads),
             1);
         const size_t virtual_base =
-            (halfka2t_factorized || halfka2tdf_factorized) ? SFNN_HALFKA2T_BASE_INPUT_SIZE : SFNN_HALFKA2_BASE_INPUT_SIZE;
+            halfka2te_factorized ? SFNN_HALFKA2TE_BASE_INPUT_SIZE
+            : (halfka2t_factorized || halfka2tdf_factorized) ? SFNN_HALFKA2T_BASE_INPUT_SIZE
+                                                             : SFNN_HALFKA2_BASE_INPUT_SIZE;
         sfnn_reduce_halfka2_virtual_l0w_gradients_kernel<<<reduce_grid, gather_threads, 0, ctx->stream>>>(
             l0w_gradients,
             ft_size,

@@ -44,6 +44,10 @@ pub const SFNN_HALFKA2T_FT_FACTORIZED_INPUT_SIZE: usize = SFNN_HALFKA2T_BASE_INP
 /// lite virtual は CPU 側で明示 emit されるので、暗黙 virtual 射影は KA2 部のみ (halfka2t と同じ)。
 pub const SFNN_HALFKA2TDF_FT_FACTORIZED_INPUT_SIZE: usize =
     crate::game::inputs::HALFKA2T_DROPFACT_TOTAL_DIMENSIONS;
+/// HalfKA2+ThreatEffect (task#73 王者移植): [KA2 131,949][ThreatEffect 26,244][KA virtual 1,629] = 159,822
+pub const SFNN_HALFKA2TE_BASE_INPUT_SIZE: usize =
+    HALFKA2_DIMENSIONS + crate::game::inputs::HALFKA2_THREATEFFECT_DIMENSIONS;
+pub const SFNN_HALFKA2TE_FT_FACTORIZED_INPUT_SIZE: usize = SFNN_HALFKA2TE_BASE_INPUT_SIZE + PIECE_INPUTS;
 
 impl SfnnForwardShape {
     pub fn l1_out(self) -> usize {
@@ -483,6 +487,9 @@ fn halfka2_ft_factorized_virtual_feature(feature: usize, cols: usize) -> Option<
         // HalfKA2+Threat(+dropfact): KA2 部のみ暗黙 virtual row へ。threat 部は factorise しない
         // (dropfact の lite virtual は sparse index に明示的に含まれているので、ここでは射影しない)
         Some(SFNN_HALFKA2T_BASE_INPUT_SIZE + feature % PIECE_INPUTS)
+    } else if cols == SFNN_HALFKA2TE_FT_FACTORIZED_INPUT_SIZE && feature < HALFKA2_DIMENSIONS {
+        // HalfKA2+ThreatEffect: KA2 部のみ暗黙 virtual row へ (effect 部 131,949..158,193 は factorise しない)
+        Some(SFNN_HALFKA2TE_BASE_INPUT_SIZE + feature % PIECE_INPUTS)
     } else {
         None
     }
