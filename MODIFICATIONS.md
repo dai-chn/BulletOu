@@ -192,3 +192,12 @@ classic 512 で ThreatEffect (長/短利き数バケット、26,244 次元) が 
   (fold は halfka2t と同じ KA virtual のみ)、export/rescore/検証バッチの分岐、テスト 2 本。
 - 検証: lib テスト (初期局面 76 特徴・重複なし・先後対称・利き数 canonical)、YO `THREAT_EFFECT_DUMP` ビルドとの index 多重集合照合は
   訓練チェーン (smoke 後) で実施。
+
+## threat 専用スライス = 列マスク `--threat-slice-cols N` (2026-09-18, task#59 ⑤, report/52 §21.1)
+
+- `crates/cuda_cpp/cpp/bulletou_cuda_backend.cu`: `mask_rows_columns_kernel` + `bulletou_cuda_cpp_mask_rows_columns_device` (行優先行列の
+  行範囲について、2 つの列区間以外を 0 にする)。
+- `crates/cuda_cpp/src/lib.rs`: `RowColumnMask` / `mask_rows_columns_device`、`SfnnTrainStepRunner::l0w_column_mask` +
+  `set_l0w_column_mask` (l0w と lookahead slow_params に即時適用)、`update_weights` で l0w の Ranger 更新直後に再適用。
+- `examples/bulletou.rs`: `--threat-slice-cols N` (SFNN halfka2t 専用)。threat 行 [131,949, 348,669) の FT 重みを pairwise 前半 [0,N) と
+  後半 [ft/2, ft/2+N) の列に限る。export は既存フォーマット (全幅、マスク外 0) なので YaneuraOu 側は無改修で動く。

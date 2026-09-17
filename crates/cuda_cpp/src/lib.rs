@@ -482,6 +482,40 @@ pub fn axpy_device(ctx: &Context, len: usize, a: f32, x: &F32Buffer, y: &F32Buff
     check(unsafe { ffi::bulletou_cuda_cpp_axpy_device(ctx.as_ptr(), len, a, x.as_ptr(), y.as_ptr(), out.as_ptr()) })
 }
 
+/// 行優先行列 `w` (行長 `cols`) の行 [row_begin, row_end) について、列が `keep[0]` にも `keep[1]` にも入らない要素を 0 にする。
+/// threat 専用スライス (列マスク、report/52 §21.1) 用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowColumnMask {
+    pub row_begin: usize,
+    pub row_end: usize,
+    pub cols: usize,
+    pub keep: [(usize, usize); 2],
+}
+
+pub fn mask_rows_columns_device(ctx: &Context, w: &F32Buffer, mask: RowColumnMask) -> Result<()> {
+    if mask.row_end > mask.row_begin && mask.row_end.checked_mul(mask.cols).map_or(true, |n| n > w.len()) {
+        return Err(CudaCppError::message(format!(
+            "mask_rows_columns: rows {}..{} x cols {} exceed buffer len {}",
+            mask.row_begin, mask.row_end, mask.cols, w.len()
+        )));
+    }
+    // SAFETY: backend validates buffer length and device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_mask_rows_columns_device(
+            ctx.as_ptr(),
+            w.as_ptr(),
+            w.len(),
+            mask.row_begin,
+            mask.row_end,
+            mask.cols,
+            mask.keep[0].0,
+            mask.keep[0].1,
+            mask.keep[1].0,
+            mask.keep[1].1,
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueForwardShape {
     pub input_size: usize,
@@ -4969,6 +5003,8 @@ pub struct SfnnTrainStepRunner {
     pub backward_workspace: SfnnBackwardWorkspace,
     pub upload_slots: Vec<SfnnTrainStepUploadSlot>,
     pub next_upload_slot: usize,
+    /// threat 専用スライスの列マスク (report/52 §21.1)。None = 無効。
+    pub l0w_column_mask: Option<RowColumnMask>,
 }
 
 impl SfnnTrainStepRunner {
@@ -5074,6 +5110,7 @@ impl SfnnTrainStepRunner {
             backward_workspace,
             upload_slots,
             next_upload_slot: 0,
+            l0w_column_mask: None,
         })
     }
 
@@ -5425,6 +5462,21 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    /// threat 専用スライスの列マスク (report/52 §21.1) を設定し、現在の l0w と lookahead の slow_params に即時適用する。
+    /// 以後は optimizer step ごとに l0w の更新直後に再適用される (マスク外の列は常に 0)。
+    pub fn set_l0w_column_mask(&mut self, ctx: &Context, mask: Option<RowColumnMask>) -> Result<()> {
+        self.l0w_column_mask = mask;
+        self.apply_l0w_column_mask(ctx)
+    }
+
+    fn apply_l0w_column_mask(&self, ctx: &Context) -> Result<()> {
+        if let Some(mask) = self.l0w_column_mask {
+            mask_rows_columns_device(ctx, &self.weights.l0w, mask)?;
+            mask_rows_columns_device(ctx, &self.optimizer_states.l0w.slow_params, mask)?;
+        }
+        Ok(())
+    }
+
     fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
         update_param_group(
             ctx,
@@ -5433,6 +5485,7 @@ impl SfnnTrainStepRunner {
             &self.weights.l0w,
             &self.optimizer_states.l0w,
         )?;
+        self.apply_l0w_column_mask(ctx)?;
         update_param_group(
             ctx,
             params,
@@ -6020,6 +6073,18 @@ mod ffi {
             x: *mut BulletOuCudaCppF32Buffer,
             y: *mut BulletOuCudaCppF32Buffer,
             out: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_mask_rows_columns_device(
+            ctx: *mut BulletOuCudaCppContext,
+            w: *mut BulletOuCudaCppF32Buffer,
+            total_len: usize,
+            row_begin: usize,
+            row_end: usize,
+            cols: usize,
+            a_lo: usize,
+            a_hi: usize,
+            b_lo: usize,
+            b_hi: usize,
         ) -> i32;
         pub fn bulletou_cuda_cpp_nnue_forward_device(
             ctx: *mut BulletOuCudaCppContext,

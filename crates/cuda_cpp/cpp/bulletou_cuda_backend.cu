@@ -317,6 +317,21 @@ __global__ void fill_f32_kernel(size_t len, float value, float* out) {
     out[idx] = value;
 }
 
+// 行 [row_begin, row_end) の、列が [a_lo, a_hi) にも [b_lo, b_hi) にも入らない要素を 0 にする (行優先、行長 cols)。
+// threat 専用スライス (report/52 §21.1): threat 行の重みを pairwise の前半/後半それぞれ先頭 N 列に限る列マスク。
+__global__ void mask_rows_columns_kernel(
+    float* w, size_t row_begin, size_t n_rows, size_t cols, size_t a_lo, size_t a_hi, size_t b_lo, size_t b_hi) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_rows * cols) {
+        return;
+    }
+    size_t col = idx % cols;
+    bool keep = (col >= a_lo && col < a_hi) || (col >= b_lo && col < b_hi);
+    if (!keep) {
+        w[row_begin * cols + idx] = 0.0f;
+    }
+}
+
 __device__ __forceinline__ void radam_update_one(
     float grad,
     float learning_rate,
@@ -5453,6 +5468,43 @@ extern "C" int bulletou_cuda_cpp_axpy_device(
     int blocks = static_cast<int>((len + threads - 1) / threads);
     axpy_kernel<<<blocks, threads, 0, ctx->stream>>>(len, a, x->ptr, y->ptr, out->ptr);
     if (check_kernel_launch("axpy_kernel launch") != 0) {
+        return -1;
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_mask_rows_columns_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w,
+    size_t total_len,
+    size_t row_begin,
+    size_t row_end,
+    size_t cols,
+    size_t a_lo,
+    size_t a_hi,
+    size_t b_lo,
+    size_t b_hi) {
+    if (validate_buffer(ctx, w, total_len, "w") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (row_end <= row_begin || cols == 0) {
+        return ok();
+    }
+    if (row_end * cols > total_len) {
+        return fail_message("mask_rows_columns: row range exceeds buffer");
+    }
+    const size_t n_rows = row_end - row_begin;
+    const size_t len = n_rows * cols;
+    constexpr int threads = 256;
+    int blocks = 0;
+    if (block_count_1d(len, threads, &blocks, "mask_rows_columns_kernel") != 0) {
+        return -1;
+    }
+    mask_rows_columns_kernel<<<blocks, threads, 0, ctx->stream>>>(w->ptr, row_begin, n_rows, cols, a_lo, a_hi, b_lo, b_hi);
+    if (check_kernel_launch("mask_rows_columns_kernel launch") != 0) {
         return -1;
     }
     return ok();

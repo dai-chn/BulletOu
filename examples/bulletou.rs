@@ -2734,6 +2734,12 @@ struct Args {
     #[arg(long = "sfnn-progress-params")]
     sfnn_progress_params: Option<PathBuf>,
 
+    /// threat 専用スライス (report/52 §21.1): SFNN halfka2t 系の threat 行 (KA2 部の後ろの行) の FT 重みを、pairwise の
+    /// 前半・後半それぞれ先頭 N 列に限る列マスク。optimizer step ごとに範囲外の列を 0 に固定する (初期重みにも適用)。
+    /// export は既存フォーマット (行は全幅、マスク外は 0) なので YaneuraOu 側の改修なしで動く。0 = 無効。
+    #[arg(long = "threat-slice-cols", default_value = "0")]
+    threat_slice_cols: usize,
+
     /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each validation event (= every `--validation-rate` superbatches,
@@ -6288,6 +6294,34 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         ),
     }
     .map_err(|e| e.to_string())?;
+    // threat 専用スライス (列マスク、report/52 §21.1): threat 行 [HALFKA2_DIMENSIONS, HALFKA2_THREAT_TOTAL_DIMENSIONS) の
+    // FT 重みを pairwise 前半 [0,N) と後半 [ft/2, ft/2+N) の列に限る。初期重みにも即時適用。
+    if args.threat_slice_cols > 0 {
+        if feature_kind != CudaCppSfnnFeatureKind::Halfka2Threat {
+            return Err(format!(
+                "--threat-slice-cols は SFNN halfka2t (Halfka2Threat) 専用です (feature kind = {feature_kind:?})"
+            ));
+        }
+        let n = args.threat_slice_cols;
+        if n * 2 > ft_size {
+            return Err(format!("--threat-slice-cols {n} は ft_size/2 = {} 以下にしてください", ft_size / 2));
+        }
+        let mask = bulletou_cuda_cpp::RowColumnMask {
+            row_begin: bulletou_lib::game::inputs::HALFKA2_DIMENSIONS,
+            row_end: bulletou_lib::game::inputs::HALFKA2_THREAT_TOTAL_DIMENSIONS,
+            cols: ft_size,
+            keep: [(0, n), (ft_size / 2, ft_size / 2 + n)],
+        };
+        runner.set_l0w_column_mask(&ctx, Some(mask)).map_err(|e| e.to_string())?;
+        eprintln!(
+            "  threat slice = {n} cols (rows {}..{}, keep cols [0,{n}) + [{},{})), threat 行の非零 = {} 値/行",
+            mask.row_begin,
+            mask.row_end,
+            ft_size / 2,
+            ft_size / 2 + n,
+            2 * n
+        );
+    }
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
     let loss_kind =
