@@ -2740,6 +2740,11 @@ struct Args {
     #[arg(long = "threat-slice-cols", default_value = "0")]
     threat_slice_cols: usize,
 
+    /// threat スライスのブロック疎 (report/52 §21.5): threat 行 t は ブロック (t % B) の列 [b*N, b*N+N) ∪ [ft/2 + b*N, ...) だけを持つ。
+    /// 1 = 全 threat 行が同じ N 列 (スライス)。B*N ≤ ft/2。
+    #[arg(long = "threat-slice-blocks", default_value = "1")]
+    threat_slice_blocks: usize,
+
     /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each validation event (= every `--validation-rate` superbatches,
@@ -6303,22 +6308,23 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ));
         }
         let n = args.threat_slice_cols;
-        if n * 2 > ft_size {
-            return Err(format!("--threat-slice-cols {n} は ft_size/2 = {} 以下にしてください", ft_size / 2));
+        let blocks = args.threat_slice_blocks.max(1);
+        if n * blocks * 2 > ft_size {
+            return Err(format!("--threat-slice-cols {n} x --threat-slice-blocks {blocks} は ft_size/2 = {} 以下にしてください", ft_size / 2));
         }
         let mask = bulletou_cuda_cpp::RowColumnMask {
             row_begin: bulletou_lib::game::inputs::HALFKA2_DIMENSIONS,
             row_end: bulletou_lib::game::inputs::HALFKA2_THREAT_TOTAL_DIMENSIONS,
             cols: ft_size,
             keep: [(0, n), (ft_size / 2, ft_size / 2 + n)],
+            blocks,
         };
         runner.set_l0w_column_mask(&ctx, Some(mask)).map_err(|e| e.to_string())?;
         eprintln!(
-            "  threat slice = {n} cols (rows {}..{}, keep cols [0,{n}) + [{},{})), threat 行の非零 = {} 値/行",
+            "  threat slice = {n} cols x {blocks} block(s) (rows {}..{}, row t keeps cols [b*{n},(b+1)*{n}) + [{}+b*{n},...), b = t % {blocks}), threat 行の非零 = {} 値/行",
             mask.row_begin,
             mask.row_end,
             ft_size / 2,
-            ft_size / 2 + n,
             2 * n
         );
     }

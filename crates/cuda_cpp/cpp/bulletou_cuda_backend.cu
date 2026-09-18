@@ -319,14 +319,18 @@ __global__ void fill_f32_kernel(size_t len, float value, float* out) {
 
 // 行 [row_begin, row_end) の、列が [a_lo, a_hi) にも [b_lo, b_hi) にも入らない要素を 0 にする (行優先、行長 cols)。
 // threat 専用スライス (report/52 §21.1): threat 行の重みを pairwise の前半/後半それぞれ先頭 N 列に限る列マスク。
+// blocks > 1 (ブロック疎、§21.5): 行 r (row_begin からの相対) はブロック b = r % blocks を持ち、列区間が b × N だけずれる
+// (a_lo + b*N .. a_hi + b*N、b_lo + b*N .. b_hi + b*N)。全行が同じ幅の列を持ちつつ、threat の情報が全列に薄く広がる。
 __global__ void mask_rows_columns_kernel(
-    float* w, size_t row_begin, size_t n_rows, size_t cols, size_t a_lo, size_t a_hi, size_t b_lo, size_t b_hi) {
+    float* w, size_t row_begin, size_t n_rows, size_t cols, size_t a_lo, size_t a_hi, size_t b_lo, size_t b_hi, size_t blocks) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_rows * cols) {
         return;
     }
+    size_t row = idx / cols;
     size_t col = idx % cols;
-    bool keep = (col >= a_lo && col < a_hi) || (col >= b_lo && col < b_hi);
+    size_t shift = (blocks > 1) ? (row % blocks) * (a_hi - a_lo) : 0;
+    bool keep = (col >= a_lo + shift && col < a_hi + shift) || (col >= b_lo + shift && col < b_hi + shift);
     if (!keep) {
         w[row_begin * cols + idx] = 0.0f;
     }
@@ -5483,7 +5487,8 @@ extern "C" int bulletou_cuda_cpp_mask_rows_columns_device(
     size_t a_lo,
     size_t a_hi,
     size_t b_lo,
-    size_t b_hi) {
+    size_t b_hi,
+    size_t blocks_per_row) {
     if (validate_buffer(ctx, w, total_len, "w") != 0) {
         return -1;
     }
@@ -5503,7 +5508,7 @@ extern "C" int bulletou_cuda_cpp_mask_rows_columns_device(
     if (block_count_1d(len, threads, &blocks, "mask_rows_columns_kernel") != 0) {
         return -1;
     }
-    mask_rows_columns_kernel<<<blocks, threads, 0, ctx->stream>>>(w->ptr, row_begin, n_rows, cols, a_lo, a_hi, b_lo, b_hi);
+    mask_rows_columns_kernel<<<blocks, threads, 0, ctx->stream>>>(w->ptr, row_begin, n_rows, cols, a_lo, a_hi, b_lo, b_hi, blocks_per_row);
     if (check_kernel_launch("mask_rows_columns_kernel launch") != 0) {
         return -1;
     }

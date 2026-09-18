@@ -490,6 +490,8 @@ pub struct RowColumnMask {
     pub row_end: usize,
     pub cols: usize,
     pub keep: [(usize, usize); 2],
+    /// ブロック疎 (report/52 §21.5): 行 r (row_begin からの相対) の列区間を (r % blocks) × 区間幅 だけずらす。1 = 全行同じ列 (スライス)。
+    pub blocks: usize,
 }
 
 pub fn mask_rows_columns_device(ctx: &Context, w: &F32Buffer, mask: RowColumnMask) -> Result<()> {
@@ -512,6 +514,7 @@ pub fn mask_rows_columns_device(ctx: &Context, w: &F32Buffer, mask: RowColumnMas
             mask.keep[0].1,
             mask.keep[1].0,
             mask.keep[1].1,
+            mask.blocks.max(1),
         )
     })
 }
@@ -6085,6 +6088,7 @@ mod ffi {
             a_hi: usize,
             b_lo: usize,
             b_hi: usize,
+            blocks: usize,
         ) -> i32;
         pub fn bulletou_cuda_cpp_nnue_forward_device(
             ctx: *mut BulletOuCudaCppContext,
