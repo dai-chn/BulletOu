@@ -2745,6 +2745,12 @@ struct Args {
     #[arg(long = "threat-slice-blocks", default_value = "1")]
     threat_slice_blocks: usize,
 
+    /// FT 重み (l0w) だけの clip 幅 |w| ≤ C の上書き (cuda-cpp SFNN 経路のみ、report/52 §23.6)。他の層は optimizer 既定 (1.98) のまま。
+    /// 1.0 にすると int16 export (w×127) が ±127 に収まり、YaneuraOu の int8 行 (`NNUE_FT_INT8_ROWS`) が残差表なし (= 上限 ×1.098) で走る。
+    /// 王者 526sb では |w| > 1.0 の FT 重みは 357M 個中 6,900 個 (0.002%) なので精度への影響は小さい見込み (未実測)。省略 = 上書きなし。
+    #[arg(long = "ft-weight-clip")]
+    ft_weight_clip: Option<f32>,
+
     /// Held-out test set (.hcpe / .psv) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
     /// each validation event (= every `--validation-rate` superbatches,
@@ -6327,6 +6333,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ft_size / 2,
             2 * n
         );
+    }
+    // FT 重みだけの clip (report/52 §23.6)。1.0 で YO int8 行の残差表が空になる。
+    if let Some(c) = args.ft_weight_clip {
+        if !(c.is_finite() && c > 0.0 && c <= BULLETOU_DEFAULT_RANGER_CLIP) {
+            return Err(format!("--ft-weight-clip {c} は (0, {BULLETOU_DEFAULT_RANGER_CLIP}] にしてください"));
+        }
+        runner.set_l0w_clip(Some((-c, c))).map_err(|e| e.to_string())?;
+        eprintln!("  ft weight clip = ±{c} (l0w のみ、他の層は ±{BULLETOU_DEFAULT_RANGER_CLIP})");
     }
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 

@@ -5008,6 +5008,9 @@ pub struct SfnnTrainStepRunner {
     pub next_upload_slot: usize,
     /// threat 専用スライスの列マスク (report/52 §21.1)。None = 無効。
     pub l0w_column_mask: Option<RowColumnMask>,
+    /// FT 重み (l0w) だけの clip 範囲の上書き (report/52 §23.6)。None = 他の層と同じ optimizer 既定 (±1.98)。
+    /// ±1.0 にすると int16 export (w×127) が ±127 に収まり、YaneuraOu の int8 行 (`NNUE_FT_INT8_ROWS`) が残差表なしで走る。
+    pub l0w_clip: Option<(f32, f32)>,
 }
 
 impl SfnnTrainStepRunner {
@@ -5114,6 +5117,7 @@ impl SfnnTrainStepRunner {
             upload_slots,
             next_upload_slot: 0,
             l0w_column_mask: None,
+            l0w_clip: None,
         })
     }
 
@@ -5480,10 +5484,28 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    /// FT 重み (l0w) の clip 範囲を他の層から切り離す (report/52 §23.6)。`Some((min, max))` は次の optimizer step から効く
+    /// (既に範囲外の重みも step 時の clamp で範囲内に入る)。None で optimizer 既定に戻す。
+    pub fn set_l0w_clip(&mut self, clip: Option<(f32, f32)>) -> Result<()> {
+        if let Some((min, max)) = clip {
+            if !(min.is_finite() && max.is_finite() && min <= max) {
+                return Err(CudaCppError::message("l0w clip range must be finite and ordered"));
+            }
+        }
+        self.l0w_clip = clip;
+        Ok(())
+    }
+
     fn update_weights(&mut self, ctx: &Context, params: RangerUpdateParams) -> Result<()> {
+        let l0w_params = match self.l0w_clip {
+            Some((min_weight, max_weight)) => {
+                RangerUpdateParams { radam: RAdamUpdateParams { min_weight, max_weight, ..params.radam }, ..params }
+            }
+            None => params,
+        };
         update_param_group(
             ctx,
-            params,
+            l0w_params,
             &self.backward_workspace.l0w_gradients,
             &self.weights.l0w,
             &self.optimizer_states.l0w,
