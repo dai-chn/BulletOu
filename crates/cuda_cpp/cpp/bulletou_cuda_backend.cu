@@ -662,6 +662,7 @@ __global__ void dense_add_bias_kernel(
 
 constexpr size_t SFNN_HALFKA2_BASE_INPUT_SIZE = 131949;
 constexpr size_t SFNN_HALFKA2_PIECE_INPUTS = 1629;
+
 constexpr size_t SFNN_HALFKA2_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
 // HalfKA2 + Threat (task#54): レイアウト [KA2 131,949][Threat 216,720][KA virtual 1,629]。
 // virtual rows は KA2 部 (feature < 131,949) のみから射影し、threat 部は factorise しない。
@@ -681,6 +682,43 @@ constexpr size_t SFNN_HALFKA2TE_EFFECT_DIMENSIONS = 26244;
 constexpr size_t SFNN_HALFKA2TE_BASE_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2TE_EFFECT_DIMENSIONS;
 constexpr size_t SFNN_HALFKA2TE_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2TE_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
 constexpr float SFNN_PAIRWISE_SCALE = 127.0f / 128.0f;
+
+// ★ブロック疎 FT 行 (shogi-nnue task#92, spec 2026-09-21-block-sparse-wide-ft-design.md): block_rows = B > 1 のとき
+//   l0w / その勾配・optimizer 状態は input × (ft/B) の compact 格納。行 f はブロック b(f) の列 [b·N, b·N+N) と
+//   [ft/2 + b·N, ft/2 + b·N + N)、N = ft/(2B)、にだけ非零を持つ。compact 座標 cc ∈ [0, ft/B): cc < N → dense 列 b·N + cc、
+//   cc ≥ N → dense 列 ft/2 + b·N + (cc − N)。B = 1 は従来の密 (恒等写像)。
+//   b(f) = (f mod 1629) mod B (KA2 の index = king_sq × 1629 + piece_sq なので同じ piece_sq の 81 行が同じブロック)。
+//   factoriser の仮想行 v = BASE + piece_sq は BASE ≢ 0 (mod 1629) なので (v − BASE) で求める = 対応する実行と同じブロック。
+__host__ __device__ __forceinline__ size_t sfnn_l0w_row_stride(size_t ft_size, size_t block_rows) {
+    return ft_size / (block_rows == 0 ? 1 : block_rows);
+}
+__device__ __forceinline__ size_t sfnn_virtual_row_base(size_t input_size) {
+    if (input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE) return SFNN_HALFKA2_BASE_INPUT_SIZE;
+    if (input_size == SFNN_HALFKA2T_FACTORIZED_INPUT_SIZE || input_size == SFNN_HALFKA2TDF_FACTORIZED_INPUT_SIZE)
+        return SFNN_HALFKA2T_BASE_INPUT_SIZE;
+    if (input_size == SFNN_HALFKA2TE_FACTORIZED_INPUT_SIZE) return SFNN_HALFKA2TE_BASE_INPUT_SIZE;
+    return input_size;   // 仮想行なし
+}
+__device__ __forceinline__ size_t sfnn_block_of(size_t feature, size_t input_size, size_t block_rows) {
+    const size_t vb = sfnn_virtual_row_base(input_size);
+    const size_t f = feature >= vb ? feature - vb : feature;
+    return (f % SFNN_HALFKA2_PIECE_INPUTS) % block_rows;
+}
+// dense 列 col → compact 座標。行 f の足跡の外なら false。
+__device__ __forceinline__ bool sfnn_compact_col(size_t feature, size_t input_size, size_t col, size_t ft_size, size_t block_rows, size_t* out) {
+    if (block_rows <= 1) { *out = col; return true; }
+    const size_t half = ft_size / 2, n = half / block_rows, b = sfnn_block_of(feature, input_size, block_rows);
+    const size_t h = col >= half ? 1 : 0, c = col - h * half;
+    if (c < b * n || c >= b * n + n) return false;
+    *out = h * n + (c - b * n);
+    return true;
+}
+// compact 座標 cc → dense 列
+__device__ __forceinline__ size_t sfnn_dense_col(size_t feature, size_t input_size, size_t cc, size_t ft_size, size_t block_rows) {
+    if (block_rows <= 1) return cc;
+    const size_t half = ft_size / 2, n = half / block_rows, b = sfnn_block_of(feature, input_size, block_rows);
+    return cc < n ? b * n + cc : half + b * n + (cc - n);
+}
 
 bool sfnn_is_grouped_l1_shape(size_t l1_group_count) {
     return l1_group_count > 1;
@@ -738,7 +776,8 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size,
+    size_t block_rows) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -752,6 +791,11 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     size_t row1 = pairwise + pair;
     size_t l0_base = sample * ft_size;
     size_t sparse_base = sample * max_active;
+    // ブロック疎 (task#92): この pair が属するブロック bp と行内オフセット off。B=1 なら n = pairwise, bp = 0, off = pair。
+    const size_t stride = sfnn_l0w_row_stride(ft_size, block_rows);
+    const size_t n = pairwise / (block_rows == 0 ? 1 : block_rows);
+    const size_t bp = pair / n;
+    const size_t off = pair - bp * n;
     float stm_sum0 = bias[row0];
     float stm_sum1 = bias[row1];
     float nstm_sum0 = bias[row0];
@@ -761,28 +805,33 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
         int stm_feature_i32 = stm_indices[sparse_base + slot];
         if (stm_feature_i32 >= 0 && static_cast<size_t>(stm_feature_i32) < input_size) {
             size_t feature = static_cast<size_t>(stm_feature_i32);
-            size_t weight_base = feature * ft_size;
-            stm_sum0 += weights[weight_base + row0];
-            stm_sum1 += weights[weight_base + row1];
-            size_t virtual_feature = 0;
-            if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
-                size_t virtual_weight_base = virtual_feature * ft_size;
-                stm_sum0 += weights[virtual_weight_base + row0];
-                stm_sum1 += weights[virtual_weight_base + row1];
+            if (block_rows <= 1 || sfnn_block_of(feature, input_size, block_rows) == bp) {
+                size_t weight_base = feature * stride;
+                stm_sum0 += weights[weight_base + off];
+                stm_sum1 += weights[weight_base + n + off];
+                size_t virtual_feature = 0;
+                if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
+                    // 仮想行は対応する実行と同じブロック (sfnn_block_of) なので同じ off で読める
+                    size_t virtual_weight_base = virtual_feature * stride;
+                    stm_sum0 += weights[virtual_weight_base + off];
+                    stm_sum1 += weights[virtual_weight_base + n + off];
+                }
             }
         }
 
         int nstm_feature_i32 = nstm_indices[sparse_base + slot];
         if (nstm_feature_i32 >= 0 && static_cast<size_t>(nstm_feature_i32) < input_size) {
             size_t feature = static_cast<size_t>(nstm_feature_i32);
-            size_t weight_base = feature * ft_size;
-            nstm_sum0 += weights[weight_base + row0];
-            nstm_sum1 += weights[weight_base + row1];
-            size_t virtual_feature = 0;
-            if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
-                size_t virtual_weight_base = virtual_feature * ft_size;
-                nstm_sum0 += weights[virtual_weight_base + row0];
-                nstm_sum1 += weights[virtual_weight_base + row1];
+            if (block_rows <= 1 || sfnn_block_of(feature, input_size, block_rows) == bp) {
+                size_t weight_base = feature * stride;
+                nstm_sum0 += weights[weight_base + off];
+                nstm_sum1 += weights[weight_base + n + off];
+                size_t virtual_feature = 0;
+                if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
+                    size_t virtual_weight_base = virtual_feature * stride;
+                    nstm_sum0 += weights[virtual_weight_base + off];
+                    nstm_sum1 += weights[virtual_weight_base + n + off];
+                }
             }
         }
     }
@@ -2014,7 +2063,8 @@ __device__ void sfnn_atomic_add_l0w_gradient(
     size_t input_size,
     size_t rows,
     size_t row,
-    float value);
+    float value,
+    size_t block_rows);
 
 __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
     const int* stm_indices,
@@ -2027,7 +2077,8 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size,
+    size_t block_rows) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -2070,10 +2121,10 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
         if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
             size_t feature = static_cast<size_t>(stm_feature);
             if (stm_grad0 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, stm_grad0);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, stm_grad0, block_rows);
             }
             if (stm_grad1 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, stm_grad1);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, stm_grad1, block_rows);
             }
         }
 
@@ -2081,10 +2132,10 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
         if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
             size_t feature = static_cast<size_t>(nstm_feature);
             if (nstm_grad0 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, nstm_grad0);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, nstm_grad0, block_rows);
             }
             if (nstm_grad1 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, nstm_grad1);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, nstm_grad1, block_rows);
             }
         }
     }
@@ -2247,13 +2298,18 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
     const int* offsets,
     float* l0w_gradients,
     size_t n_features,
+    size_t input_size,
     size_t ft_size,
+    size_t block_rows,
     int add_to_existing) {
+    // row は compact 座標 (B=1 なら dense と同じ)。pre_gradients は dense (sample × ft) なので列を写す。
     size_t feature = blockIdx.x;
     size_t row = blockIdx.y * blockDim.x + threadIdx.x;
-    if (feature >= n_features || row >= ft_size) {
+    const size_t stride = sfnn_l0w_row_stride(ft_size, block_rows);
+    if (feature >= n_features || row >= stride) {
         return;
     }
+    const size_t dcol = sfnn_dense_col(feature, input_size, row, ft_size, block_rows);
 
     size_t off_start = static_cast<size_t>(offsets[feature]);
     size_t off_end = static_cast<size_t>(offsets[feature + 1]);
@@ -2268,19 +2324,19 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
         size_t sample1 = static_cast<size_t>(positions[i + 1]);
         size_t sample2 = static_cast<size_t>(positions[i + 2]);
         size_t sample3 = static_cast<size_t>(positions[i + 3]);
-        sum0 += pre_gradients[sample0 * ft_size + row];
-        sum1 += pre_gradients[sample1 * ft_size + row];
-        sum2 += pre_gradients[sample2 * ft_size + row];
-        sum3 += pre_gradients[sample3 * ft_size + row];
+        sum0 += pre_gradients[sample0 * ft_size + dcol];
+        sum1 += pre_gradients[sample1 * ft_size + dcol];
+        sum2 += pre_gradients[sample2 * ft_size + dcol];
+        sum3 += pre_gradients[sample3 * ft_size + dcol];
         i += 4;
     }
     while (i < off_end) {
         size_t sample = static_cast<size_t>(positions[i]);
-        sum0 += pre_gradients[sample * ft_size + row];
+        sum0 += pre_gradients[sample * ft_size + dcol];
         ++i;
     }
     float sum = (sum0 + sum1) + (sum2 + sum3);
-    size_t weight_idx = feature * ft_size + row;
+    size_t weight_idx = feature * stride + row;
     if (add_to_existing != 0) {
         l0w_gradients[weight_idx] += sum;
     } else {
@@ -2310,12 +2366,17 @@ __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     l0w_gradients[virtual_feature * ft_size + row] = sum;
 }
 
-__device__ void sfnn_atomic_add_l0w_gradient(float* gradients, size_t feature, size_t input_size, size_t rows, size_t row, float value) {
-    size_t weight_idx = feature * rows + row;
-    atomicAdd(&gradients[weight_idx], value);
+__device__ void sfnn_atomic_add_l0w_gradient(float* gradients, size_t feature, size_t input_size, size_t rows, size_t row, float value, size_t block_rows) {
+    // rows = dense の ft 幅。ブロック疎 (task#92) では compact 座標に写し、足跡の外なら何もしない。
+    size_t cc = 0;
+    if (!sfnn_compact_col(feature, input_size, row, rows, block_rows, &cc)) {
+        return;
+    }
+    const size_t stride = sfnn_l0w_row_stride(rows, block_rows);
+    atomicAdd(&gradients[feature * stride + cc], value);
     size_t virtual_feature = 0;
     if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
-        atomicAdd(&gradients[virtual_feature * rows + row], value);
+        atomicAdd(&gradients[virtual_feature * stride + cc], value);   // 仮想行は同ブロック → 同じ cc
     }
 }
 
@@ -2333,7 +2394,8 @@ __global__ void sfnn_l0_sparse_backward_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size,
+    size_t block_rows) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t l0_len = batch * ft_size;
     if (tid >= l0_len) {
@@ -2357,13 +2419,13 @@ __global__ void sfnn_l0_sparse_backward_kernel(
     for (size_t slot = 0; slot < max_active; ++slot) {
         int stm_feature = stm_indices[sparse_base + slot];
         if (stm_grad != 0.0f && stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
-            sfnn_atomic_add_l0w_gradient(l0w_gradients, static_cast<size_t>(stm_feature), input_size, ft_size, row, stm_grad);
+            sfnn_atomic_add_l0w_gradient(l0w_gradients, static_cast<size_t>(stm_feature), input_size, ft_size, row, stm_grad, block_rows);
         }
 
         int nstm_feature = nstm_indices[sparse_base + slot];
         if (nstm_grad != 0.0f && nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
             sfnn_atomic_add_l0w_gradient(
-                l0w_gradients, static_cast<size_t>(nstm_feature), input_size, ft_size, row, nstm_grad);
+                l0w_gradients, static_cast<size_t>(nstm_feature), input_size, ft_size, row, nstm_grad, block_rows);
         }
     }
 }
@@ -3054,8 +3116,12 @@ int validate_sfnn_shape(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active) {
+    if (block_rows == 0 || (block_rows > 1 && (ft_size % (2 * block_rows) != 0 || (ft_size / (2 * block_rows)) % 32 != 0))) {
+        return fail_message("SFNN block_rows must divide ft/2 into 32-aligned blocks");
+    }
     if (input_size == 0 || ft_size == 0 || l1_hidden == 0 || l2_size == 0 || num_stacks == 0 || l1_group_count == 0) {
         return fail_message("SFNN shape dimensions must be greater than zero");
     }
@@ -3262,6 +3328,7 @@ int launch_sfnn_forward_kernels(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active,
     const int* stm_indices,
@@ -3313,6 +3380,7 @@ int launch_sfnn_forward_kernels(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active) != 0) {
         return -1;
@@ -3346,7 +3414,8 @@ int launch_sfnn_forward_kernels(
         batch,
         max_active,
         input_size,
-        ft_size);
+        ft_size,
+        block_rows);
     if (check_kernel_launch("sfnn_sparse_l0_pairwise_concat_kernel launch") != 0) {
         return -1;
     }
@@ -3518,6 +3587,7 @@ int launch_zero_sfnn_backward_parameter_gradients(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     float* l0w_gradients,
     float* l0b_gradients,
     float* l1w_gradients,
@@ -3708,7 +3778,9 @@ int launch_sfnn_inverse_index_for_perspective(
     size_t batch,
     size_t max_active,
     size_t n_features,
+    size_t input_size,
     size_t ft_size,
+    size_t block_rows,
     int add_to_existing) {
     constexpr int count_threads = 256;
     constexpr int scan_threads = 1024;
@@ -3779,9 +3851,10 @@ int launch_sfnn_inverse_index_for_perspective(
         return -1;
     }
 
+    const size_t l0w_stride = sfnn_l0w_row_stride(ft_size, block_rows);
     dim3 gather_grid(
         static_cast<unsigned int>(n_features),
-        static_cast<unsigned int>((ft_size + gather_threads - 1) / gather_threads),
+        static_cast<unsigned int>((l0w_stride + gather_threads - 1) / gather_threads),
         1);
     sfnn_inverse_gather_l0w_gradients_kernel<<<gather_grid, gather_threads, 0, ctx->stream>>>(
         pre_gradients,
@@ -3789,7 +3862,9 @@ int launch_sfnn_inverse_index_for_perspective(
         ctx->sfnn_inverse_offsets,
         l0w_gradients,
         n_features,
+        input_size,
         ft_size,
+        block_rows,
         add_to_existing);
     if (check_kernel_launch("sfnn_inverse_gather_l0w_gradients_kernel launch") != 0) {
         return -1;
@@ -3811,7 +3886,8 @@ int launch_sfnn_inverse_index_l0_backward(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size,
+    size_t block_rows) {
     constexpr int threads = 256;
     int blocks = 0;
     if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_pregrad_kernel") != 0) {
@@ -3858,7 +3934,9 @@ int launch_sfnn_inverse_index_l0_backward(
             batch,
             max_active,
             n_features,
+            input_size,
             ft_size,
+            block_rows,
             0) != 0 ||
         launch_sfnn_inverse_index_for_perspective(
             ctx,
@@ -3868,7 +3946,9 @@ int launch_sfnn_inverse_index_l0_backward(
             batch,
             max_active,
             n_features,
+            input_size,
             ft_size,
+            block_rows,
             1) != 0) {
         return -1;
     }
@@ -3877,7 +3957,7 @@ int launch_sfnn_inverse_index_l0_backward(
         constexpr int gather_threads = 128;
         dim3 reduce_grid(
             static_cast<unsigned int>(SFNN_HALFKA2_PIECE_INPUTS),
-            static_cast<unsigned int>((ft_size + gather_threads - 1) / gather_threads),
+            static_cast<unsigned int>((sfnn_l0w_row_stride(ft_size, block_rows) + gather_threads - 1) / gather_threads),
             1);
         const size_t virtual_base =
             halfka2te_factorized ? SFNN_HALFKA2TE_BASE_INPUT_SIZE
@@ -3885,7 +3965,7 @@ int launch_sfnn_inverse_index_l0_backward(
                                                              : SFNN_HALFKA2_BASE_INPUT_SIZE;
         sfnn_reduce_halfka2_virtual_l0w_gradients_kernel<<<reduce_grid, gather_threads, 0, ctx->stream>>>(
             l0w_gradients,
-            ft_size,
+            sfnn_l0w_row_stride(ft_size, block_rows),
             SFNN_HALFKA2_BASE_INPUT_SIZE,
             virtual_base);
         if (check_kernel_launch("sfnn_reduce_halfka2_virtual_l0w_gradients_kernel launch") != 0) {
@@ -3908,6 +3988,7 @@ int launch_sfnn_backward_kernels(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active,
     const int* stm_indices,
@@ -3980,6 +4061,7 @@ int launch_sfnn_backward_kernels(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active) != 0) {
         return -1;
@@ -4019,6 +4101,7 @@ int launch_sfnn_backward_kernels(
                 l1_shard_size,
                 factorizer_king_axis_dim,
                 factorizer_hand_axis_dim,
+                block_rows,
                 l0w_gradients,
                 l0b_gradients,
                 l1w_gradients,
@@ -4362,7 +4445,8 @@ int launch_sfnn_backward_kernels(
                 batch,
                 max_active,
                 input_size,
-                ft_size) != 0) {
+                ft_size,
+                block_rows) != 0) {
             return -1;
         }
     } else {
@@ -4392,7 +4476,8 @@ int launch_sfnn_backward_kernels(
             batch,
             max_active,
             input_size,
-            ft_size);
+            ft_size,
+            block_rows);
         if (check_kernel_launch("sfnn_l0_sparse_backward_kernel launch") != 0) {
             return -1;
         }
@@ -5699,6 +5784,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -5757,12 +5843,13 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active) != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(nstm_indices), batch * max_active, "sfnn nstm_indices") != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(buckets), batch, "sfnn buckets") != 0 ||
-        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l0w), input_size * ft_size, "sfnn l0w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l0w), input_size * sfnn_l0w_row_stride(ft_size, block_rows), "sfnn l0w") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l0b), ft_size, "sfnn l0b") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1w), l1w_len, "sfnn l1w") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1b), num_stacks * l1_out, "sfnn l1b") != 0 ||
@@ -5846,6 +5933,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active,
             stm_indices->ptr,
@@ -6520,6 +6608,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -6595,6 +6684,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active) != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
@@ -6618,7 +6708,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         validate_buffer(ctx, nstm_l0_gradients, batch * ft_size, "sfnn nstm_l0_gradients") != 0 ||
         validate_buffer(ctx, stm_l0_pre_gradients, batch * ft_size, "sfnn stm_l0_pre_gradients") != 0 ||
         validate_buffer(ctx, nstm_l0_pre_gradients, batch * ft_size, "sfnn nstm_l0_pre_gradients") != 0 ||
-        validate_buffer(ctx, l0w_gradients, input_size * ft_size, "sfnn l0w_gradients") != 0 ||
+        validate_buffer(ctx, l0w_gradients, input_size * sfnn_l0w_row_stride(ft_size, block_rows), "sfnn l0w_gradients") != 0 ||
         validate_buffer(ctx, l0b_gradients, ft_size, "sfnn l0b_gradients") != 0 ||
         validate_buffer(ctx, l1w_gradients, l1w_len, "sfnn l1w_gradients") != 0 ||
         validate_buffer(ctx, l1b_gradients, num_stacks * l1_out, "sfnn l1b_gradients") != 0 ||
@@ -6701,6 +6791,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active,
             stm_indices->ptr,
@@ -6780,6 +6871,7 @@ int sfnn_backward_train_device_impl(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -6858,6 +6950,7 @@ int sfnn_backward_train_device_impl(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active) != 0 ||
         validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(stm_indices), batch * max_active, "sfnn stm_indices") != 0 ||
@@ -6881,7 +6974,7 @@ int sfnn_backward_train_device_impl(
         validate_buffer(ctx, nstm_l0_gradients, batch * ft_size, "sfnn nstm_l0_gradients") != 0 ||
         validate_buffer(ctx, stm_l0_pre_gradients, batch * ft_size, "sfnn stm_l0_pre_gradients") != 0 ||
         validate_buffer(ctx, nstm_l0_pre_gradients, batch * ft_size, "sfnn nstm_l0_pre_gradients") != 0 ||
-        validate_buffer(ctx, l0w_gradients, input_size * ft_size, "sfnn l0w_gradients") != 0 ||
+        validate_buffer(ctx, l0w_gradients, input_size * sfnn_l0w_row_stride(ft_size, block_rows), "sfnn l0w_gradients") != 0 ||
         validate_buffer(ctx, l0b_gradients, ft_size, "sfnn l0b_gradients") != 0 ||
         validate_buffer(ctx, l1w_gradients, l1w_len, "sfnn l1w_gradients") != 0 ||
         validate_buffer(ctx, l1b_gradients, num_stacks * l1_out, "sfnn l1b_gradients") != 0 ||
@@ -6964,6 +7057,7 @@ int sfnn_backward_train_device_impl(
             l1_shard_size,
             factorizer_king_axis_dim,
             factorizer_hand_axis_dim,
+            block_rows,
             batch,
             max_active,
             stm_indices->ptr,
@@ -7043,6 +7137,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -7113,6 +7208,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         l1_shard_size,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
+        block_rows,
         batch,
         max_active,
         stm_indices,
@@ -7187,6 +7283,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     size_t l1_shard_size,
     size_t factorizer_king_axis_dim,
     size_t factorizer_hand_axis_dim,
+    size_t block_rows,
     size_t batch,
     size_t max_active,
     const BulletOuCudaCppI32Buffer* stm_indices,
@@ -7259,6 +7356,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         l1_shard_size,
         factorizer_king_axis_dim,
         factorizer_hand_axis_dim,
+        block_rows,
         batch,
         max_active,
         stm_indices,

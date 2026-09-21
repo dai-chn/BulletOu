@@ -860,9 +860,22 @@ pub struct SfnnForwardShape {
     /// 32 means buckets can be decomposed as `hand_stm * 32 + hand_non_stm`.
     /// `0` means there is no hand axis.
     pub factorizer_hand_axis_dim: usize,
+    /// ブロック疎 FT (task#92, spec 2026-09-21-block-sparse-wide-ft-design.md): 行 f は W' = ft_size 幅の accumulator の
+    /// ブロック b(f) = (f mod 1629) mod B (仮想行は BASE 相対) の列 [b*N, b*N+N) ∪ [ft/2 + b*N, ...) (N = ft/(2B)) だけを持ち、
+    /// l0w はその 2N = ft/B 値だけを compact に格納する (input_size × ft_size/B)。1 = 密 (従来どおり)。
+    pub block_rows: usize,
 }
 
 impl SfnnForwardShape {
+    /// compact l0w の 1 行の値数 (ft_size / block_rows)。
+    pub fn l0w_row_stride(self) -> usize {
+        self.ft_size / self.block_rows.max(1)
+    }
+
+    pub fn l0w_len(self) -> usize {
+        self.input_size.saturating_mul(self.l0w_row_stride())
+    }
+
     pub fn l1_out(self) -> usize {
         self.l1_hidden + 1
     }
@@ -1080,7 +1093,7 @@ impl SfnnForwardHostWeights<'_> {
     pub fn validate(self) -> Result<()> {
         let shape = self.shape;
         validate_sfnn_shape(shape)?;
-        expect_len("sfnn l0w", checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?, self.l0w.len())?;
+        expect_len("sfnn l0w", checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?, self.l0w.len())?;
         expect_len("sfnn l0b", shape.ft_size, self.l0b.len())?;
         expect_len("sfnn l1w", shape.l1w_len()?, self.l1w.len())?;
         expect_len("sfnn l1b", checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?, self.l1b.len())?;
@@ -1266,7 +1279,7 @@ impl SfnnForwardDeviceWeights {
         validate_sfnn_shape(shape)?;
         expect_len(
             "device sfnn l0w",
-            checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?,
+            checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?,
             self.l0w.len(),
         )?;
         expect_len("device sfnn l0b", shape.ft_size, self.l0b.len())?;
@@ -1582,6 +1595,7 @@ pub fn sfnn_forward_device_with_factorizer(
             shape.l1_shard_size,
             shape.factorizer_king_axis_dim,
             shape.factorizer_hand_axis_dim,
+            shape.block_rows,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2281,7 +2295,7 @@ impl SfnnBackwardWorkspaceLayout {
     }
 
     pub fn l0w_gradients_len(self) -> usize {
-        self.shape.input_size.saturating_mul(self.shape.ft_size)
+        self.shape.l0w_len()
     }
 
     pub fn l0b_gradients_len(self) -> usize {
@@ -2760,6 +2774,7 @@ pub fn sfnn_backward_train_profile_device_with_factorizer(
             shape.l1_shard_size,
             shape.factorizer_king_axis_dim,
             shape.factorizer_hand_axis_dim,
+            shape.block_rows,
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2935,6 +2950,7 @@ fn sfnn_backward_device_impl(
                 shape.l1_shard_size,
                 shape.factorizer_king_axis_dim,
                 shape.factorizer_hand_axis_dim,
+                shape.block_rows,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -3007,6 +3023,7 @@ fn sfnn_backward_device_impl(
                 shape.l1_shard_size,
                 shape.factorizer_king_axis_dim,
                 shape.factorizer_hand_axis_dim,
+                shape.block_rows,
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -4016,7 +4033,7 @@ impl SfnnRangerOptimizerStates {
         states: SfnnRangerOptimizerHostStates<'_>,
     ) -> Result<Self> {
         validate_sfnn_shape(shape)?;
-        let l0w_len = checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?;
+        let l0w_len = checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?;
         let l1w_len = shape.l1w_len()?;
         let l2w_len = checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?;
         let l3w_len = checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?;
@@ -4168,7 +4185,7 @@ impl SfnnRangerOptimizerStates {
     }
 
     fn validate(&self, shape: SfnnForwardShape) -> Result<()> {
-        self.l0w.validate(checked_product("sfnn l0w", &[shape.input_size, shape.ft_size])?, "optimizer sfnn l0w")?;
+        self.l0w.validate(checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?, "optimizer sfnn l0w")?;
         self.l0b.validate(shape.ft_size, "optimizer sfnn l0b")?;
         self.l1w.validate(shape.l1w_len()?, "optimizer sfnn l1w")?;
         self.l1b.validate(shape.num_stacks * shape.l1_out(), "optimizer sfnn l1b")?;
@@ -5472,6 +5489,9 @@ impl SfnnTrainStepRunner {
     /// threat 専用スライスの列マスク (report/52 §21.1) を設定し、現在の l0w と lookahead の slow_params に即時適用する。
     /// 以後は optimizer step ごとに l0w の更新直後に再適用される (マスク外の列は常に 0)。
     pub fn set_l0w_column_mask(&mut self, ctx: &Context, mask: Option<RowColumnMask>) -> Result<()> {
+        if mask.is_some() && self.weights.shape.block_rows > 1 {
+            return Err(CudaCppError::message("l0w column mask is not supported with block-rows (compact l0w)"));
+        }
         self.l0w_column_mask = mask;
         self.apply_l0w_column_mask(ctx)
     }
@@ -5662,6 +5682,13 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
         || shape.ft_size % 2 != 0
     {
         Err(CudaCppError::message(format!("SFNN shape dimensions are invalid: {shape:?}")))
+    } else if shape.block_rows == 0
+        || (shape.block_rows > 1
+            && (shape.ft_size % (2 * shape.block_rows) != 0 || (shape.ft_size / (2 * shape.block_rows)) % 32 != 0))
+    {
+        Err(CudaCppError::message(format!(
+            "SFNN block-rows shape is invalid (need ft_size % (2*B) == 0 and ft_size/(2*B) % 32 == 0): {shape:?}"
+        )))
     } else if has_common_shard_marker
         && (shape.l1_shard_size == 0
             || shape.l1_group_count <= 1
@@ -6294,6 +6321,7 @@ mod ffi {
             l1_shard_size: usize,
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
+            block_rows: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6347,6 +6375,7 @@ mod ffi {
             l1_shard_size: usize,
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
+            block_rows: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6417,6 +6446,7 @@ mod ffi {
             l1_shard_size: usize,
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
+            block_rows: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6488,6 +6518,7 @@ mod ffi {
             l1_shard_size: usize,
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
+            block_rows: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6662,6 +6693,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
@@ -6688,6 +6720,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 3);
 
@@ -6725,6 +6758,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -6750,6 +6784,7 @@ mod tests {
             l1_shard_size: 256,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -6772,6 +6807,7 @@ mod tests {
             l1_shard_size: 1024,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let c0_layout = SfnnBackwardWorkspaceLayout::new(c0_shape, 5, 40);
 
@@ -7183,6 +7219,204 @@ mod tests {
         assert_eq!(staged_i.download(&ctx).unwrap(), vec![3, 4, 5]);
     }
 
+    /// ブロック疎 FT (task#92): compact l0w (B=2) の forward / backward / 1 step が、足跡の外を 0 にした密 l0w (B=1) と一致する
+    /// (密側の足跡外の勾配・更新は比較しない)。
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_block_rows_matches_dense_gpu() {
+        let input_size = 8usize;
+        let ft = 128usize;
+        let b_count = 2usize;
+        let n = ft / (2 * b_count);
+        let stride = ft / b_count;
+        let dense_shape = SfnnForwardShape {
+            input_size,
+            ft_size: ft,
+            l1_hidden: 2,
+            l2_size: 2,
+            num_stacks: 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
+            block_rows: 1,
+        };
+        let compact_shape = SfnnForwardShape { block_rows: b_count, ..dense_shape };
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move |scale: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            ((seed % 2001) as f32 - 1000.0) / 1000.0 * scale
+        };
+        let compact: Vec<f32> = (0..input_size * stride).map(|_| rnd(0.5)).collect();
+        let mut dense = vec![0.0f32; input_size * ft];
+        for f in 0..input_size {
+            let b = (f % 1629) % b_count;
+            for j in 0..n {
+                dense[f * ft + b * n + j] = compact[f * stride + j];
+                dense[f * ft + ft / 2 + b * n + j] = compact[f * stride + n + j];
+            }
+        }
+        let compact_of = |dense_l0w: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; input_size * stride];
+            for f in 0..input_size {
+                let b = (f % 1629) % b_count;
+                for j in 0..n {
+                    out[f * stride + j] = dense_l0w[f * ft + b * n + j];
+                    out[f * stride + n + j] = dense_l0w[f * ft + ft / 2 + b * n + j];
+                }
+            }
+            out
+        };
+        let l1_out = dense_shape.l1_out();
+        let other: [Vec<f32>; 7] = [
+            (0..ft).map(|_| rnd(0.1)).collect(),
+            (0..dense_shape.num_stacks * l1_out * ft).map(|_| rnd(0.1)).collect(),
+            (0..dense_shape.num_stacks * l1_out).map(|_| rnd(0.1)).collect(),
+            (0..dense_shape.num_stacks * dense_shape.l2_size * dense_shape.l2_in()).map(|_| rnd(0.3)).collect(),
+            (0..dense_shape.num_stacks * dense_shape.l2_size).map(|_| rnd(0.1)).collect(),
+            (0..dense_shape.num_stacks * dense_shape.l2_size).map(|_| rnd(0.3)).collect(),
+            (0..dense_shape.num_stacks).map(|_| rnd(0.1)).collect(),
+        ];
+        fn mk<'a>(shape: SfnnForwardShape, l0w: &'a [f32], o: &'a [Vec<f32>; 7]) -> SfnnForwardHostWeights<'a> {
+            SfnnForwardHostWeights {
+                shape,
+                l0w,
+                l0b: &o[0],
+                l1w: &o[1],
+                l1b: &o[2],
+                l1fw: None,
+                l1fb: None,
+                l1axw: None,
+                l1axb: None,
+                l2w: &o[3],
+                l2b: &o[4],
+                l2fw: None,
+                l2fb: None,
+                l2axw: None,
+                l2axb: None,
+                l3w: &o[5],
+                l3b: &o[6],
+                l3fw: None,
+                l3fb: None,
+                l3axw: None,
+                l3axb: None,
+            }
+        }
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 3, -1, 2, 5, 7, 1, -1, -1, 6, 4, 0],
+            nstm_indices: &[2, 6, -1, 1, -1, -1, 7, 3, 5, 0, -1, -1],
+            buckets: &[0, 1, 1, 0],
+            batch_size: 4,
+            max_active: 3,
+        };
+        let targets = [0.25, 0.75, 0.6, 0.1];
+        let entry_weights = [1.0, 0.5, 0.75, 1.25];
+        let params = RangerUpdateParams {
+            radam: RAdamUpdateParams {
+                step: 1,
+                learning_rate: 0.01,
+                beta1: 0.9,
+                beta2: 0.999,
+                min_weight: -1.98,
+                max_weight: 1.98,
+                ..RAdamUpdateParams::default()
+            },
+            lookahead_alpha: 0.5,
+            lookahead_period: 6,
+        };
+
+        let ctx = Context::new(0).unwrap();
+        let run = |weights: SfnnForwardHostWeights<'_>| {
+            let shape = weights.shape;
+            let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+            let device_weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
+            let forward =
+                SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, batch.batch_size)).unwrap();
+            sfnn_forward_device(&ctx, &device_batch, &device_weights, &forward).unwrap();
+            let output = forward.download_output(&ctx).unwrap();
+            let targets_dev = F32Buffer::from_host(&ctx, &targets).unwrap();
+            let entry_weights_dev = F32Buffer::from_host(&ctx, &entry_weights).unwrap();
+            let loss = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size)).unwrap();
+            scalar_loss_device_from_buffers(
+                &ctx,
+                ScalarLossKind::SigmoidMse,
+                1.0,
+                batch.batch_size,
+                &forward.output,
+                &targets_dev,
+                &entry_weights_dev,
+                &loss,
+            )
+            .unwrap();
+            let layout = SfnnBackwardWorkspaceLayout::new(shape, batch.batch_size, batch.max_active);
+            let backward = SfnnBackwardWorkspace::new(&ctx, layout).unwrap();
+            sfnn_backward_device(&ctx, &device_batch, &device_weights, &forward, &loss, &backward).unwrap();
+            let plain = backward.download(&ctx).unwrap();
+            // the train entry accumulates into caller-zeroed parameter gradients (the runner zeroes them every step)
+            let backward_train = SfnnBackwardWorkspace::new(&ctx, layout).unwrap();
+            backward_train.zero_parameter_gradients(&ctx).unwrap();
+            sfnn_backward_train_device(&ctx, &device_batch, &device_weights, &forward, &loss, &backward_train).unwrap();
+            let train = backward_train.download(&ctx).unwrap();
+            let mut runner = SfnnTrainStepRunner::new(&ctx, weights, batch.batch_size, batch.max_active).unwrap();
+            runner
+                .step(
+                    &ctx,
+                    params,
+                    ScalarLossKind::SigmoidMse,
+                    1.0,
+                    SfnnTrainStepHostBatch {
+                        stm_indices: batch.stm_indices,
+                        nstm_indices: batch.nstm_indices,
+                        buckets: batch.buckets,
+                        targets: &targets,
+                        entry_weights: &entry_weights,
+                        batch_size: batch.batch_size,
+                        max_active: batch.max_active,
+                    },
+                )
+                .unwrap();
+            let stepped = runner.read_weights(&ctx).unwrap();
+            (output, plain, train, stepped)
+        };
+        let (out_d, plain_d, train_d, step_d) = run(mk(dense_shape, &dense, &other));
+        let (out_c, plain_c, train_c, step_c) = run(mk(compact_shape, &compact, &other));
+
+        assert_close_slice("block output", &out_c, &out_d, 1.0e-5);
+        assert_eq!(plain_c.l0w_gradients.len(), input_size * stride);
+        assert_close_slice("block l0w_grad", &plain_c.l0w_gradients, &compact_of(&plain_d.l0w_gradients), 1.0e-6);
+        assert_close_slice("block l0b_grad", &plain_c.l0b_gradients, &plain_d.l0b_gradients, 1.0e-6);
+        assert_close_slice("block stm_l0_grad", &plain_c.stm_l0_gradients, &plain_d.stm_l0_gradients, 1.0e-6);
+        assert_close_slice("block nstm_l0_grad", &plain_c.nstm_l0_gradients, &plain_d.nstm_l0_gradients, 1.0e-6);
+        assert_close_slice("block l1w_grad", &plain_c.l1w_gradients, &plain_d.l1w_gradients, 1.0e-6);
+        assert_close_slice("block l1b_grad", &plain_c.l1b_gradients, &plain_d.l1b_gradients, 1.0e-6);
+        assert_close_slice("block l2w_grad", &plain_c.l2w_gradients, &plain_d.l2w_gradients, 1.0e-6);
+        assert_close_slice("block l3w_grad", &plain_c.l3w_gradients, &plain_d.l3w_gradients, 1.0e-6);
+        assert_close_slice("block train l0w_grad", &train_c.l0w_gradients, &compact_of(&train_d.l0w_gradients), 1.0e-6);
+        assert_close_slice("block train l0b_grad", &train_c.l0b_gradients, &train_d.l0b_gradients, 1.0e-6);
+        assert_close_slice("block train l1w_grad", &train_c.l1w_gradients, &train_d.l1w_gradients, 1.0e-6);
+        assert_close_slice("block train l2w_grad", &train_c.l2w_gradients, &train_d.l2w_gradients, 1.0e-6);
+        assert_eq!(step_c.l0w.len(), input_size * stride);
+        assert_close_slice("block step l0w", &step_c.l0w, &compact_of(&step_d.l0w), 1.0e-6);
+        assert_close_slice("block step l0b", &step_c.l0b, &step_d.l0b, 1.0e-6);
+        assert_close_slice("block step l1w", &step_c.l1w, &step_d.l1w, 1.0e-6);
+        assert_close_slice("block step l2w", &step_c.l2w, &step_d.l2w, 1.0e-6);
+        // the dense run does move weights outside the footprint (they had a non-zero gradient); the block run cannot
+        let moved_outside = (0..input_size * ft)
+            .filter(|&i| {
+                let f = i / ft;
+                let col = i % ft;
+                let b = (f % 1629) % b_count;
+                let c = if col >= ft / 2 { col - ft / 2 } else { col };
+                let inside = c >= b * n && c < b * n + n;
+                !inside && step_d.l0w[i] != 0.0
+            })
+            .count();
+        assert!(moved_outside > 0, "test setup: the dense reference should touch out-of-footprint weights");
+    }
+
     fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static> {
         assert_eq!(shape, NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 });
         NnueForwardHostWeights {
@@ -7223,6 +7457,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         }
     }
 

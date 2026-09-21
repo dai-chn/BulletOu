@@ -2745,6 +2745,12 @@ struct Args {
     #[arg(long = "threat-slice-blocks", default_value = "1")]
     threat_slice_blocks: usize,
 
+    /// ブロック疎 FT (task#92, spec 2026-09-21-block-sparse-wide-ft-design.md、cuda-cpp SFNN 経路のみ): 行 f は幅 ft の accumulator の
+    /// ブロック b(f) = (f mod 1629) mod B (factoriser の仮想行は BASE 相対) の列 [b*N, b*N+N) ∪ [ft/2 + b*N, ...) (N = ft/(2B)) だけを持ち、
+    /// l0w はその ft/B 値だけを compact に持つ (state.bin も compact)。YaneuraOu 側は -DNNUE_FT_BLOCK_ROWS=B のビルドで読む。1 = 密。
+    #[arg(long = "ft-block-rows", default_value = "1")]
+    ft_block_rows: usize,
+
     /// FT 重み (l0w) だけの clip 幅 |w| ≤ C の上書き (cuda-cpp SFNN 経路のみ、report/52 §23.6)。他の層は optimizer 既定 (1.98) のまま。
     /// 1.0 にすると int16 export (w×127) が ±127 に収まり、YaneuraOu の int8 行 (`NNUE_FT_INT8_ROWS`) が残差表なし (= 上限 ×1.098) で走る。
     /// 王者 526sb では |w| > 1.0 の FT 重みは 357M 個中 6,900 個 (0.002%) なので精度への影響は小さい見込み (未実測)。省略 = 上書きなし。
@@ -4147,6 +4153,80 @@ impl CudaCppSfnnFeatureKind {
             Self::Halfka2ThreatEffect => ShogiHalfKa2ThreatEffect.max_active(),
         }
     }
+}
+
+/// ブロック疎 FT (task#92): 行 f のブロック番号 b(f) = (f mod 1629) mod B。factoriser の仮想行 v = BASE + piece_sq は
+/// BASE ≢ 0 (mod 1629) なので (v − BASE) で求める = 射影元の実行と同じブロック (CUDA 側 sfnn_block_of と同一規則)。
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_block_of_row(feature_kind: CudaCppSfnnFeatureKind, row: usize, block_rows: usize) -> usize {
+    let vb = if feature_kind.virtual_rows() > 0 { feature_kind.base_input_size() } else { usize::MAX };
+    let f = if row >= vb { row - vb } else { row };
+    (f % bulletou_lib::game::inputs::PIECE_INPUTS) % block_rows
+}
+
+/// compact l0w (input × ft/B) → 密 l0w (input × ft、足跡の外は 0)。
+#[cfg(feature = "cuda-cpp-backend")]
+fn expand_sfnn_block_l0w(
+    feature_kind: CudaCppSfnnFeatureKind,
+    compact: &[f32],
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+) -> Result<Vec<f32>, String> {
+    let b_count = shape.block_rows.max(1);
+    let stride = shape.l0w_row_stride();
+    let ft = shape.ft_size;
+    if compact.len() != shape.input_size * stride {
+        return Err(format!(
+            "compact l0w has length {}, expected {} x {} (ft {} / block_rows {})",
+            compact.len(),
+            shape.input_size,
+            stride,
+            ft,
+            b_count
+        ));
+    }
+    if b_count == 1 {
+        return Ok(compact.to_vec());
+    }
+    let half = ft / 2;
+    let n = half / b_count;
+    let mut dense = vec![0.0_f32; shape.input_size * ft];
+    for row in 0..shape.input_size {
+        let b = sfnn_block_of_row(feature_kind, row, b_count);
+        let src = &compact[row * stride..(row + 1) * stride];
+        let dst = &mut dense[row * ft..(row + 1) * ft];
+        dst[b * n..b * n + n].copy_from_slice(&src[..n]);
+        dst[half + b * n..half + b * n + n].copy_from_slice(&src[n..2 * n]);
+    }
+    Ok(dense)
+}
+
+/// 密 l0w (input × ft) → compact l0w (input × ft/B)。足跡の外の値は捨てる (初期化用)。
+#[cfg(feature = "cuda-cpp-backend")]
+fn compact_sfnn_block_l0w(
+    feature_kind: CudaCppSfnnFeatureKind,
+    dense: &[f32],
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+) -> Result<Vec<f32>, String> {
+    let b_count = shape.block_rows.max(1);
+    let stride = shape.l0w_row_stride();
+    let ft = shape.ft_size;
+    if dense.len() != shape.input_size * ft {
+        return Err(format!("dense l0w has length {}, expected {} x {}", dense.len(), shape.input_size, ft));
+    }
+    if b_count == 1 {
+        return Ok(dense.to_vec());
+    }
+    let half = ft / 2;
+    let n = half / b_count;
+    let mut compact = vec![0.0_f32; shape.input_size * stride];
+    for row in 0..shape.input_size {
+        let b = sfnn_block_of_row(feature_kind, row, b_count);
+        let src = &dense[row * ft..(row + 1) * ft];
+        let dst = &mut compact[row * stride..(row + 1) * stride];
+        dst[..n].copy_from_slice(&src[b * n..b * n + n]);
+        dst[n..2 * n].copy_from_slice(&src[half + b * n..half + b * n + n]);
+    }
+    Ok(compact)
 }
 
 /// feature kind に応じた l0w の fold (訓練時の仮想行込み → export の base 行)。
@@ -6249,6 +6329,17 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             initial_weights.shape.input_size
         );
     }
+    if initial_weights.shape.block_rows > 1 {
+        eprintln!(
+            "  ft block rows = B={} (row keeps ft/B = {} values = N {} per pairwise half; block b(f) = (f mod 1629) mod B, virtual rows relative to BASE {}; compact l0w {} x {})",
+            initial_weights.shape.block_rows,
+            initial_weights.shape.l0w_row_stride(),
+            initial_weights.shape.l0w_row_stride() / 2,
+            feature_kind.base_input_size(),
+            initial_weights.shape.input_size,
+            initial_weights.shape.l0w_row_stride()
+        );
+    }
     eprintln!("  SFNN factorizer = {}", factorizer_spec.label());
     eprintln!(
         "  factorizer tensors = shared[L1 {}, L2 {}, L3 {}], axis[L1 {}, L2 {}, L3 {}; king_dim={}, hand_dim={}]",
@@ -6308,6 +6399,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     // threat 専用スライス (列マスク、report/52 §21.1): threat 行 [HALFKA2_DIMENSIONS, HALFKA2_THREAT_TOTAL_DIMENSIONS) の
     // FT 重みを pairwise 前半 [0,N) と後半 [ft/2, ft/2+N) の列に限る。初期重みにも即時適用。
     if args.threat_slice_cols > 0 {
+        if args.ft_block_rows > 1 {
+            return Err("--threat-slice-cols と --ft-block-rows は併用できません (compact l0w に列マスクは無い)".to_string());
+        }
         if feature_kind != CudaCppSfnnFeatureKind::Halfka2Threat {
             return Err(format!(
                 "--threat-slice-cols は SFNN halfka2t (Halfka2Threat) 専用です (feature kind = {feature_kind:?})"
@@ -7524,6 +7618,7 @@ fn run_cuda_cpp_sfnn_rescore(args: &Args) -> Result<(), String> {
         l1_shard_size: 0,
         factorizer_king_axis_dim: shape.factorizer_king_axis_dim,
         factorizer_hand_axis_dim: shape.factorizer_hand_axis_dim,
+        block_rows: 1,
     };
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
     let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(
@@ -7689,6 +7784,7 @@ fn run_cuda_cpp_sfnn_final_validation(
         l1_shard_size: 0,
         factorizer_king_axis_dim: shape.factorizer_king_axis_dim,
         factorizer_hand_axis_dim: shape.factorizer_hand_axis_dim,
+        block_rows: 1,
     };
     let context_started = std::time::Instant::now();
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
@@ -8157,10 +8253,17 @@ fn cuda_cpp_sfnn_weights_for_cpu_validation(
     let base_input_size = feature_kind.base_input_size();
     let virtual_rows = feature_kind.virtual_rows();
     let factorized_input_size = base_input_size + virtual_rows;
+    let expanded_l0w;
+    let dense_l0w: &[f32] = if shape.block_rows > 1 {
+        expanded_l0w = expand_sfnn_block_l0w(feature_kind, &weights.l0w, shape)?;
+        &expanded_l0w
+    } else {
+        &weights.l0w
+    };
     let l0w = if shape.input_size == base_input_size {
-        weights.l0w.clone()
+        dense_l0w.to_vec()
     } else if virtual_rows > 0 && shape.input_size == factorized_input_size {
-        fold_sfnn_l0w_for_kind(feature_kind, &weights.l0w, shape.ft_size)?
+        fold_sfnn_l0w_for_kind(feature_kind, dense_l0w, shape.ft_size)?
     } else {
         return Err(format!(
             "cannot validate cuda-cpp {} SFNN weights with input_size={}, expected {} or factorized {}",
@@ -9110,6 +9213,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
         l1_shard_size: args.arch().sfnn_l1_shard_size(),
         factorizer_king_axis_dim: layerstack.factorizer_king_axis_dim(),
         factorizer_hand_axis_dim: layerstack.factorizer_hand_axis_dim(),
+        block_rows: args.ft_block_rows.max(1),
     };
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
@@ -9128,6 +9232,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     if input_size != base_input_size {
         l0w.resize(input_size * ft_size, 0.0);
     }
+    let l0w = if shape.block_rows > 1 { compact_sfnn_block_l0w(feature_kind, &l0w, shape)? } else { l0w };
     let l0b = cuda_cpp_tatara_uniform_fan_in_init(ft_size, 0x5f11_e002, base_input_size, init_scale);
 
     let l1_fan_in = if common_shard_l1 { shape.l1_common_shard_input() } else { ft_size };
@@ -9230,6 +9335,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         l1_shard_size: args.arch().sfnn_l1_shard_size(),
         factorizer_king_axis_dim: layerstack.factorizer_king_axis_dim(),
         factorizer_hand_axis_dim: layerstack.factorizer_hand_axis_dim(),
+        block_rows: args.ft_block_rows.max(1),
     };
     let mut weights = load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, weights).map_err(|err| {
         format!(
@@ -9328,16 +9434,18 @@ fn load_cuda_cpp_sfnn_weights_from_records(
     }
 
     let mut l0w = load_cuda_cpp_weight_record(records, "l0w")?;
-    let expected_factorized_l0w = shape.input_size * shape.ft_size;
-    let expected_base_l0w = base_input_size * shape.ft_size;
+    let expected_factorized_l0w = shape.input_size * shape.l0w_row_stride();
+    let expected_base_l0w = base_input_size * shape.l0w_row_stride();
     if feature_kind.virtual_rows() > 0 && l0w.len() == expected_base_l0w {
         l0w.resize(expected_factorized_l0w, 0.0);
     } else if l0w.len() != expected_factorized_l0w {
         return Err(format!(
-            "weight l0w has length {}, expected {} or base-only {}",
+            "weight l0w has length {}, expected {} or base-only {} (ft_size {} / block_rows {}; state.bin の l0w は --ft-block-rows と同じ compact 幅で)",
             l0w.len(),
             expected_factorized_l0w,
-            expected_base_l0w
+            expected_base_l0w,
+            shape.ft_size,
+            shape.block_rows
         ));
     }
 
@@ -10200,12 +10308,19 @@ fn write_cuda_cpp_sfnn_nn_bin(
             factorized_input_size
         ));
     }
+    let expanded_l0w;
+    let dense_l0w: &[f32] = if shape.block_rows > 1 {
+        expanded_l0w = expand_sfnn_block_l0w(feature_kind, &weights.l0w, shape)?;
+        &expanded_l0w
+    } else {
+        &weights.l0w
+    };
     let folded_l0w;
     let l0w_for_export: &[f32] = if shape.input_size == base_input_size {
-        &weights.l0w
+        dense_l0w
     } else if virtual_rows > 0 {
         folded_l0w =
-            fold_sfnn_l0w_for_kind(feature_kind, &weights.l0w, shape.ft_size)?;
+            fold_sfnn_l0w_for_kind(feature_kind, dense_l0w, shape.ft_size)?;
         &folded_l0w
     } else {
         return Err(format!(
@@ -15341,6 +15456,7 @@ mod tests {
                 l1_shard_size: args.arch().sfnn_l1_shard_size(),
                 factorizer_king_axis_dim: 0,
                 factorizer_hand_axis_dim: 0,
+                block_rows: 1,
             };
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
             assert_eq!(shape.l1_group_input(), group_input, "{arch}");
@@ -15409,6 +15525,7 @@ mod tests {
                 l1_shard_size: args.arch().sfnn_l1_shard_size(),
                 factorizer_king_axis_dim: 0,
                 factorizer_hand_axis_dim: 0,
+                block_rows: 1,
             };
             assert!(shape.has_common_shard_l1(), "{arch}");
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
@@ -15467,6 +15584,7 @@ mod tests {
                 l1_shard_size: args.arch().sfnn_l1_shard_size(),
                 factorizer_king_axis_dim: 0,
                 factorizer_hand_axis_dim: 0,
+                block_rows: 1,
             };
             assert_eq!(shape.input_size, ShogiKa2.num_inputs(), "{arch}");
             assert_eq!(shape.l1_group_count(), group_count, "{arch}");
@@ -15689,6 +15807,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let weights = CudaCppSfnnInitialWeights {
             shape,
@@ -15858,6 +15977,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let l1_out = shape.l1_out();
         let mut l1w = vec![
@@ -15900,6 +16020,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let l2_in = shape.l2_in();
         let mut l2w = vec![
@@ -15952,6 +16073,7 @@ mod tests {
             l1_shard_size: 0,
             factorizer_king_axis_dim: 2,
             factorizer_hand_axis_dim: 0,
+            block_rows: 1,
         };
         let mut l3w = vec![0.0, 10.0, 20.0, 30.0];
         let mut l3b = vec![0.0, 100.0, 200.0, 300.0];
@@ -17268,5 +17390,83 @@ mod tests {
         let diffs = input.iter().zip(output.iter()).filter(|(a, b)| a != b).count();
         assert!(diffs <= report.fc2_candidates, "final differing bytes cannot exceed the candidate set");
         assert!(diffs > 0, "at least one byte should differ after repeated edits");
+    }
+}
+
+/// ブロック疎 FT (task#92) の compact ⇄ 密 変換と、仮想行が射影元の実行と同じブロックに落ちる規則の検査。
+#[cfg(all(test, feature = "cuda-cpp-backend"))]
+mod sfnn_block_rows_tests {
+    use super::*;
+
+    fn shape(kind: CudaCppSfnnFeatureKind, ft_size: usize, block_rows: usize) -> bulletou_cuda_cpp::SfnnForwardShape {
+        bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: kind.training_input_size(),
+            ft_size,
+            l1_hidden: 8,
+            l2_size: 64,
+            num_stacks: 9,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
+            block_rows,
+        }
+    }
+
+    #[test]
+    fn virtual_rows_share_the_block_of_their_real_rows() {
+        let piece = bulletou_lib::game::inputs::PIECE_INPUTS;
+        for kind in [CudaCppSfnnFeatureKind::Halfka2, CudaCppSfnnFeatureKind::Halfka2Threat] {
+            let base = kind.base_input_size();
+            for b_count in [2usize, 4] {
+                for p in (0..piece).step_by(7) {
+                    let virtual_block = sfnn_block_of_row(kind, base + p, b_count);
+                    assert_eq!(virtual_block, p % b_count, "{kind:?} B={b_count} p={p}");
+                    for king in [0usize, 1, 40, 80] {
+                        assert_eq!(sfnn_block_of_row(kind, king * piece + p, b_count), virtual_block);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_expand_round_trip_keeps_only_the_block_footprint() {
+        let kind = CudaCppSfnnFeatureKind::Halfka2Threat;
+        let ft = 256;
+        let b_count = 2;
+        let shape = shape(kind, ft, b_count);
+        let input = shape.input_size;
+        let dense: Vec<f32> = (0..input * ft).map(|i| (i % 1_000_003) as f32 * 0.001).collect();
+        let compact = compact_sfnn_block_l0w(kind, &dense, shape).unwrap();
+        assert_eq!(compact.len(), input * ft / b_count);
+        let expanded = expand_sfnn_block_l0w(kind, &compact, shape).unwrap();
+        assert_eq!(expanded.len(), dense.len());
+        let half = ft / 2;
+        let n = half / b_count;
+        for row in [0usize, 1, 1628, 1629, 131_948, 131_949, 348_668, 348_669, input - 1] {
+            let b = sfnn_block_of_row(kind, row, b_count);
+            for col in 0..ft {
+                let h = col / half;
+                let c = col - h * half;
+                let inside = c >= b * n && c < b * n + n;
+                let expected = if inside { dense[row * ft + col] } else { 0.0 };
+                assert_eq!(expanded[row * ft + col], expected, "row {row} col {col}");
+            }
+        }
+        // compact → 密 → compact は恒等
+        assert_eq!(compact_sfnn_block_l0w(kind, &expanded, shape).unwrap(), compact);
+        // 密 (B=1) は素通し
+        let dense_shape = shape_with_block_rows(shape, 1);
+        assert_eq!(compact_sfnn_block_l0w(kind, &dense, dense_shape).unwrap(), dense);
+    }
+
+    fn shape_with_block_rows(
+        mut s: bulletou_cuda_cpp::SfnnForwardShape,
+        block_rows: usize,
+    ) -> bulletou_cuda_cpp::SfnnForwardShape {
+        s.block_rows = block_rows;
+        s
     }
 }
