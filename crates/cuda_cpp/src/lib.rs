@@ -7224,9 +7224,25 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sfnn_block_rows_matches_dense_gpu() {
-        let input_size = 8usize;
+        sfnn_block_rows_matches_dense_gpu_impl(8, 0);
+    }
+
+    /// 同上を halfka2 の factorized 実サイズ (131,949 + 仮想行 1,629) で: 仮想行 (BASE 相対のブロック) の暗黙射影・reduce と、
+    /// バッファ長の取り違え (密の長さで fill すると隣を壊す = 09-22 の wide2048b2 の事故) を実サイズで検出する。
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_block_rows_factorized_matches_dense_gpu() {
+        sfnn_block_rows_matches_dense_gpu_impl(131_949 + 1_629, 131_949);
+    }
+
+    /// `virtual_base` = 0 なら仮想行なし。仮想行 v ≥ virtual_base のブロックは (v − virtual_base) 相対 (CUDA sfnn_block_of と同じ)。
+    fn sfnn_block_rows_matches_dense_gpu_impl(input_size: usize, virtual_base: usize) {
         let ft = 128usize;
         let b_count = 2usize;
+        let block_of = |f: usize| -> usize {
+            let g = if virtual_base > 0 && f >= virtual_base { f - virtual_base } else { f };
+            (g % 1629) % b_count
+        };
         let n = ft / (2 * b_count);
         let stride = ft / b_count;
         let dense_shape = SfnnForwardShape {
@@ -7253,7 +7269,7 @@ mod tests {
         let compact: Vec<f32> = (0..input_size * stride).map(|_| rnd(0.5)).collect();
         let mut dense = vec![0.0f32; input_size * ft];
         for f in 0..input_size {
-            let b = (f % 1629) % b_count;
+            let b = block_of(f);
             for j in 0..n {
                 dense[f * ft + b * n + j] = compact[f * stride + j];
                 dense[f * ft + ft / 2 + b * n + j] = compact[f * stride + n + j];
@@ -7305,9 +7321,17 @@ mod tests {
                 l3axb: None,
             }
         }
+        // 特徴 (k, p): 小さい入力では p だけ、factorized 実サイズでは king k の行 k*1629 + p (< 131,949 = 仮想行の射影元)。
+        // 同じ p を複数の k で使う = 仮想行 (BASE + p) への暗黙射影と reduce (king 和) を通す。
+        let feat = |k: usize, p: i32| -> i32 { if p < 0 { -1 } else if input_size > 1629 { (k * 1629) as i32 + p } else { p } };
+        let stm_raw: [i32; 12] = [0, 3, -1, 2, 5, 7, 1, -1, -1, 6, 4, 0];
+        let nstm_raw: [i32; 12] = [2, 6, -1, 1, -1, -1, 7, 3, 5, 0, -1, -1];
+        let kings = [0usize, 17, 40, 80];
+        let stm_vec: Vec<i32> = stm_raw.iter().enumerate().map(|(i, &p)| feat(kings[i / 3], p)).collect();
+        let nstm_vec: Vec<i32> = nstm_raw.iter().enumerate().map(|(i, &p)| feat(kings[(i / 3 + 1) % 4], p)).collect();
         let batch = SfnnForwardHostBatch {
-            stm_indices: &[0, 3, -1, 2, 5, 7, 1, -1, -1, 6, 4, 0],
-            nstm_indices: &[2, 6, -1, 1, -1, -1, 7, 3, 5, 0, -1, -1],
+            stm_indices: &stm_vec,
+            nstm_indices: &nstm_vec,
             buckets: &[0, 1, 1, 0],
             batch_size: 4,
             max_active: 3,
@@ -7408,7 +7432,7 @@ mod tests {
             .filter(|&i| {
                 let f = i / ft;
                 let col = i % ft;
-                let b = (f % 1629) % b_count;
+                let b = block_of(f);
                 let c = if col >= ft / 2 { col - ft / 2 } else { col };
                 let inside = c >= b * n && c < b * n + n;
                 !inside && step_d.l0w[i] != 0.0

@@ -3615,7 +3615,8 @@ int launch_zero_sfnn_backward_parameter_gradients(
     const size_t l1w_len =
         sfnn_l1w_len_for_shape(ft_size, l1_hidden, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     if (zero_l0w_gradients != 0 &&
-        launch_fill_f32_raw(ctx, l0w_gradients, input_size * ft_size, 0.0f, "sfnn zero l0w_gradients") != 0) {
+        // compact (task#92): input × ft/B。密の長さで fill すると隣のバッファを毎ステップ壊す (09-22 wide2048b2 で loss 3.7 倍の原因)
+        launch_fill_f32_raw(ctx, l0w_gradients, input_size * sfnn_l0w_row_stride(ft_size, block_rows), 0.0f, "sfnn zero l0w_gradients") != 0) {
         return -1;
     }
     if (launch_fill_f32_raw(ctx, l0b_gradients, ft_size, 0.0f, "sfnn zero l0b_gradients") != 0 ||
