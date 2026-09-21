@@ -7235,6 +7235,14 @@ mod tests {
         sfnn_block_rows_matches_dense_gpu_impl(131_949 + 1_629, 131_949);
     }
 
+    /// halfka2t の実サイズ (KA2 131,949 + threat 216,720 + 仮想行 1,629 = 350,298): threat 行 (factorise されない、ブロックは散らし) と
+    /// KA2 行 (仮想行へ射影) が混在する本番の入力空間。
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_block_rows_halfka2t_matches_dense_gpu() {
+        sfnn_block_rows_matches_dense_gpu_impl(131_949 + 216_720 + 1_629, 131_949 + 216_720);
+    }
+
     /// `virtual_base` = 0 なら仮想行なし。仮想行 v ≥ virtual_base のブロックは (v − virtual_base) 相対 (CUDA sfnn_block_of と同じ)。
     fn sfnn_block_rows_matches_dense_gpu_impl(input_size: usize, virtual_base: usize) {
         let ft = 128usize;
@@ -7278,7 +7286,7 @@ mod tests {
         let compact_of = |dense_l0w: &[f32]| -> Vec<f32> {
             let mut out = vec![0.0f32; input_size * stride];
             for f in 0..input_size {
-                let b = (f % 1629) % b_count;
+                let b = block_of(f);
                 for j in 0..n {
                     out[f * stride + j] = dense_l0w[f * ft + b * n + j];
                     out[f * stride + n + j] = dense_l0w[f * ft + ft / 2 + b * n + j];
@@ -7327,8 +7335,18 @@ mod tests {
         let stm_raw: [i32; 12] = [0, 3, -1, 2, 5, 7, 1, -1, -1, 6, 4, 0];
         let nstm_raw: [i32; 12] = [2, 6, -1, 1, -1, -1, 7, 3, 5, 0, -1, -1];
         let kings = [0usize, 17, 40, 80];
-        let stm_vec: Vec<i32> = stm_raw.iter().enumerate().map(|(i, &p)| feat(kings[i / 3], p)).collect();
-        let nstm_vec: Vec<i32> = nstm_raw.iter().enumerate().map(|(i, &p)| feat(kings[(i / 3 + 1) % 4], p)).collect();
+        let mut stm_vec: Vec<i32> = stm_raw.iter().enumerate().map(|(i, &p)| feat(kings[i / 3], p)).collect();
+        let mut nstm_vec: Vec<i32> = nstm_raw.iter().enumerate().map(|(i, &p)| feat(kings[(i / 3 + 1) % 4], p)).collect();
+        if virtual_base > 131_949 {
+            // halfka2t: threat 行 (131,949..virtual_base) も混ぜる (両ブロック、仮想行への射影なし)
+            let threat = |t: usize| -> i32 { (131_949 + t) as i32 };
+            stm_vec[2] = threat(0);
+            stm_vec[7] = threat(1);
+            stm_vec[8] = threat(216_719);
+            nstm_vec[1] = threat(1630);
+            nstm_vec[4] = threat(5);
+            nstm_vec[10] = threat(100_000);
+        }
         let batch = SfnnForwardHostBatch {
             stm_indices: &stm_vec,
             nstm_indices: &nstm_vec,
@@ -7410,6 +7428,47 @@ mod tests {
 
         assert_close_slice("block output", &out_c, &out_d, 1.0e-5);
         assert_eq!(plain_c.l0w_gradients.len(), input_size * stride);
+        // 診断: どの行領域がどれだけ食い違うか (KA2 / threat / 仮想行) を先に出す
+        let summarize = |label: &str, got: &[f32], want: &[f32]| {
+            let mut rows: std::collections::BTreeMap<usize, (usize, f32)> = std::collections::BTreeMap::new();
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                if (g - w).abs() > 1.0e-6 {
+                    let e = rows.entry(i / stride).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 = e.1.max((g - w).abs());
+                }
+            }
+            if !rows.is_empty() {
+                eprintln!("{label}: {} mismatching rows", rows.len());
+                for (r, (cnt, mx)) in rows.iter().take(12) {
+                    let region = if virtual_base > 0 && *r >= virtual_base { "virtual" } else if *r >= 131_949 && virtual_base > 131_949 { "threat" } else { "ka2" };
+                    eprintln!("  row {r} ({region}, block {}): {cnt} cols, max diff {mx:.3e}", block_of(*r));
+                }
+            }
+        };
+        summarize("plain l0w_grad", &plain_c.l0w_gradients, &compact_of(&plain_d.l0w_gradients));
+        summarize("train l0w_grad", &train_c.l0w_gradients, &compact_of(&train_d.l0w_gradients));
+        if virtual_base > 0 {
+            // 仮想行 p=0 の詳細: compact の 64 値 / 密の自ブロック列 / 密の他ブロック列 / 密の KA2 行 (k=0,p=0) の自ブロック列
+            let v = virtual_base;
+            let b = block_of(v);
+            let ob = 1 - b;
+            let dense_row = |r: usize, blk: usize| -> Vec<f32> {
+                let mut out = Vec::new();
+                for j in 0..n { out.push(plain_d.l0w_gradients[r * ft + blk * n + j]); }
+                for j in 0..n { out.push(plain_d.l0w_gradients[r * ft + ft / 2 + blk * n + j]); }
+                out
+            };
+            let cvals = &plain_c.l0w_gradients[v * stride..(v + 1) * stride];
+            eprintln!("virtual row {v} block {b}: compact[0..8]      = {:?}", &cvals[..8]);
+            eprintln!("virtual row {v} block {b}: dense same-block   = {:?}", &dense_row(v, b)[..8]);
+            eprintln!("virtual row {v} block {b}: dense other-block  = {:?}", &dense_row(v, ob)[..8]);
+            eprintln!("ka2 row 0 (k=0,p=0) block {}: compact[0..8]   = {:?}", block_of(0), &plain_c.l0w_gradients[0..8]);
+            eprintln!("ka2 row 0 (k=0,p=0): dense same-block         = {:?}", &dense_row(0, block_of(0))[..8]);
+            let k80 = 80 * 1629;
+            eprintln!("ka2 row {k80} (k=80,p=0): compact[0..8]      = {:?}", &plain_c.l0w_gradients[k80 * stride..k80 * stride + 8]);
+            eprintln!("ka2 row {k80} (k=80,p=0): dense same-block    = {:?}", &dense_row(k80, block_of(k80))[..8]);
+        }
         assert_close_slice("block l0w_grad", &plain_c.l0w_gradients, &compact_of(&plain_d.l0w_gradients), 1.0e-6);
         assert_close_slice("block l0b_grad", &plain_c.l0b_gradients, &plain_d.l0b_gradients, 1.0e-6);
         assert_close_slice("block stm_l0_grad", &plain_c.stm_l0_gradients, &plain_d.stm_l0_gradients, 1.0e-6);
