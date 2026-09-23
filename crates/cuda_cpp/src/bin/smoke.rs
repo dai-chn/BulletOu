@@ -319,6 +319,9 @@ fn tiny_sfnn_shape() -> SfnnForwardShape {
         factorizer_king_axis_dim: 0,
         factorizer_hand_axis_dim: 0,
         block_rows: 1,
+        chunk_size: 0,
+        chunk_k_max: 0,
+        l0w_compact_len: 0,
     }
 }
 
@@ -381,6 +384,9 @@ fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static>
         l3fb: Some(&[0.004]),
         l3axw: None,
         l3axb: None,
+        chunk_slots: None,
+        chunk_kidx: None,
+        chunk_row_offset: None,
     }
 }
 

@@ -864,6 +864,14 @@ pub struct SfnnForwardShape {
     /// ブロック b(f) = (f mod 1629) mod B (仮想行は BASE 相対) の列 [b*N, b*N+N) ∪ [ft/2 + b*N, ...) (N = ft/(2B)) だけを持ち、
     /// l0w はその 2N = ft/B 値だけを compact に格納する (input_size × ft_size/B)。1 = 密 (従来どおり)。
     pub block_rows: usize,
+    /// chunk レイアウト (task#92 v2 「chunk 散布」): chunk_size > 0 のとき、行 f は幅 ft の accumulator を chunk_size ごとに切った
+    /// chunk のうち行ごとの集合 (表 chunk_slots / chunk_kidx / chunk_row_offset、weights 側) にだけ接続し、l0w はその値だけを
+    /// 行ごと可変長で compact に持つ。密 / 分割 / narrow / threat 散布 / 広域散布はすべて表の作り方の違い。0 = 表なし。
+    pub chunk_size: usize,
+    /// chunk_slots 表の行幅 (行あたり chunk 数の最大)。
+    pub chunk_k_max: usize,
+    /// chunk レイアウトの compact l0w 総長 (= chunk_row_offset[input] × chunk_size)。表なしのときは 0。
+    pub l0w_compact_len: usize,
 }
 
 impl SfnnForwardShape {
@@ -873,7 +881,19 @@ impl SfnnForwardShape {
     }
 
     pub fn l0w_len(self) -> usize {
-        self.input_size.saturating_mul(self.l0w_row_stride())
+        if self.chunk_size > 0 {
+            self.l0w_compact_len
+        } else {
+            self.input_size.saturating_mul(self.l0w_row_stride())
+        }
+    }
+
+    pub fn has_chunk_layout(self) -> bool {
+        self.chunk_size > 0
+    }
+
+    pub fn chunk_count(self) -> usize {
+        if self.chunk_size > 0 { self.ft_size / self.chunk_size } else { 0 }
     }
 
     pub fn l1_out(self) -> usize {
@@ -1087,13 +1107,18 @@ pub struct SfnnForwardHostWeights<'a> {
     pub l3fb: Option<&'a [f32]>,
     pub l3axw: Option<&'a [f32]>,
     pub l3axb: Option<&'a [f32]>,
+    /// chunk レイアウトの表 (shape.chunk_size > 0 のとき必須): [input × k_max] / [input × n_chunks] / [input + 1]
+    pub chunk_slots: Option<&'a [i32]>,
+    pub chunk_kidx: Option<&'a [i32]>,
+    pub chunk_row_offset: Option<&'a [i32]>,
 }
 
 impl SfnnForwardHostWeights<'_> {
     pub fn validate(self) -> Result<()> {
+        validate_sfnn_chunk_tables(self.shape, self.chunk_slots, self.chunk_kidx, self.chunk_row_offset)?;
         let shape = self.shape;
         validate_sfnn_shape(shape)?;
-        expect_len("sfnn l0w", checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?, self.l0w.len())?;
+        expect_len("sfnn l0w", shape.l0w_len(), self.l0w.len())?;
         expect_len("sfnn l0b", shape.ft_size, self.l0b.len())?;
         expect_len("sfnn l1w", shape.l1w_len()?, self.l1w.len())?;
         expect_len("sfnn l1b", checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?, self.l1b.len())?;
@@ -1244,6 +1269,9 @@ pub struct SfnnForwardDeviceWeights {
     pub l3fb: Option<F32Buffer>,
     pub l3axw: Option<F32Buffer>,
     pub l3axb: Option<F32Buffer>,
+    pub chunk_slots: Option<I32Buffer>,
+    pub chunk_kidx: Option<I32Buffer>,
+    pub chunk_row_offset: Option<I32Buffer>,
 }
 
 impl SfnnForwardDeviceWeights {
@@ -1271,6 +1299,9 @@ impl SfnnForwardDeviceWeights {
             l3fb: weights.l3fb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l3axw: weights.l3axw.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
             l3axb: weights.l3axb.map(|values| F32Buffer::from_host(ctx, values)).transpose()?,
+            chunk_slots: weights.chunk_slots.map(|values| I32Buffer::from_host(ctx, values)).transpose()?,
+            chunk_kidx: weights.chunk_kidx.map(|values| I32Buffer::from_host(ctx, values)).transpose()?,
+            chunk_row_offset: weights.chunk_row_offset.map(|values| I32Buffer::from_host(ctx, values)).transpose()?,
         })
     }
 
@@ -1279,7 +1310,7 @@ impl SfnnForwardDeviceWeights {
         validate_sfnn_shape(shape)?;
         expect_len(
             "device sfnn l0w",
-            checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?,
+            shape.l0w_len(),
             self.l0w.len(),
         )?;
         expect_len("device sfnn l0b", shape.ft_size, self.l0b.len())?;
@@ -1596,6 +1627,12 @@ pub fn sfnn_forward_device_with_factorizer(
             shape.factorizer_king_axis_dim,
             shape.factorizer_hand_axis_dim,
             shape.block_rows,
+            shape.chunk_size,
+            shape.chunk_k_max,
+            opt_i32_buffer_ptr(&weights.chunk_slots),
+            opt_i32_buffer_ptr(&weights.chunk_kidx),
+            opt_i32_buffer_ptr(&weights.chunk_row_offset),
+            shape.l0w_len(),
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2775,6 +2812,12 @@ pub fn sfnn_backward_train_profile_device_with_factorizer(
             shape.factorizer_king_axis_dim,
             shape.factorizer_hand_axis_dim,
             shape.block_rows,
+            shape.chunk_size,
+            shape.chunk_k_max,
+            opt_i32_buffer_ptr(&weights.chunk_slots),
+            opt_i32_buffer_ptr(&weights.chunk_kidx),
+            opt_i32_buffer_ptr(&weights.chunk_row_offset),
+            shape.l0w_len(),
             batch.batch_size,
             batch.max_active,
             batch.stm_indices.as_ptr(),
@@ -2951,6 +2994,12 @@ fn sfnn_backward_device_impl(
                 shape.factorizer_king_axis_dim,
                 shape.factorizer_hand_axis_dim,
                 shape.block_rows,
+                shape.chunk_size,
+                shape.chunk_k_max,
+                opt_i32_buffer_ptr(&weights.chunk_slots),
+                opt_i32_buffer_ptr(&weights.chunk_kidx),
+                opt_i32_buffer_ptr(&weights.chunk_row_offset),
+                shape.l0w_len(),
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -3024,6 +3073,12 @@ fn sfnn_backward_device_impl(
                 shape.factorizer_king_axis_dim,
                 shape.factorizer_hand_axis_dim,
                 shape.block_rows,
+                shape.chunk_size,
+                shape.chunk_k_max,
+                opt_i32_buffer_ptr(&weights.chunk_slots),
+                opt_i32_buffer_ptr(&weights.chunk_kidx),
+                opt_i32_buffer_ptr(&weights.chunk_row_offset),
+                shape.l0w_len(),
                 batch.batch_size,
                 batch.max_active,
                 batch.stm_indices.as_ptr(),
@@ -4033,7 +4088,7 @@ impl SfnnRangerOptimizerStates {
         states: SfnnRangerOptimizerHostStates<'_>,
     ) -> Result<Self> {
         validate_sfnn_shape(shape)?;
-        let l0w_len = checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?;
+        let l0w_len = shape.l0w_len();
         let l1w_len = shape.l1w_len()?;
         let l2w_len = checked_product("sfnn l2w", &[shape.num_stacks, shape.l2_size, shape.l2_in()])?;
         let l3w_len = checked_product("sfnn l3w", &[shape.num_stacks, shape.l2_size])?;
@@ -4185,7 +4240,7 @@ impl SfnnRangerOptimizerStates {
     }
 
     fn validate(&self, shape: SfnnForwardShape) -> Result<()> {
-        self.l0w.validate(checked_product("sfnn l0w", &[shape.input_size, shape.l0w_row_stride()])?, "optimizer sfnn l0w")?;
+        self.l0w.validate(shape.l0w_len(), "optimizer sfnn l0w")?;
         self.l0b.validate(shape.ft_size, "optimizer sfnn l0b")?;
         self.l1w.validate(shape.l1w_len()?, "optimizer sfnn l1w")?;
         self.l1b.validate(shape.num_stacks * shape.l1_out(), "optimizer sfnn l1b")?;
@@ -5489,7 +5544,7 @@ impl SfnnTrainStepRunner {
     /// threat 専用スライスの列マスク (report/52 §21.1) を設定し、現在の l0w と lookahead の slow_params に即時適用する。
     /// 以後は optimizer step ごとに l0w の更新直後に再適用される (マスク外の列は常に 0)。
     pub fn set_l0w_column_mask(&mut self, ctx: &Context, mask: Option<RowColumnMask>) -> Result<()> {
-        if mask.is_some() && self.weights.shape.block_rows > 1 {
+        if mask.is_some() && (self.weights.shape.block_rows > 1 || self.weights.shape.chunk_size > 0) {
             return Err(CudaCppError::message("l0w column mask is not supported with block-rows (compact l0w)"));
         }
         self.l0w_column_mask = mask;
@@ -5666,6 +5721,43 @@ fn validate_nnue_shape(shape: NnueForwardShape) -> Result<()> {
     }
 }
 
+/// chunk レイアウト表の整合 (長さ・単調・総長)。表なしの shape に表が付いていてもエラー。
+fn validate_sfnn_chunk_tables(
+    shape: SfnnForwardShape,
+    slots: Option<&[i32]>,
+    kidx: Option<&[i32]>,
+    row_offset: Option<&[i32]>,
+) -> Result<()> {
+    if shape.chunk_size == 0 {
+        if slots.is_some() || kidx.is_some() || row_offset.is_some() {
+            return Err(CudaCppError::message("chunk tables given but shape.chunk_size == 0"));
+        }
+        return Ok(());
+    }
+    let (Some(slots), Some(kidx), Some(row_offset)) = (slots, kidx, row_offset) else {
+        return Err(CudaCppError::message("chunk layout needs chunk_slots / chunk_kidx / chunk_row_offset"));
+    };
+    let n_chunks = shape.chunk_count();
+    expect_len("sfnn chunk_slots", shape.input_size.saturating_mul(shape.chunk_k_max), slots.len())?;
+    expect_len("sfnn chunk_kidx", shape.input_size.saturating_mul(n_chunks), kidx.len())?;
+    expect_len("sfnn chunk_row_offset", shape.input_size + 1, row_offset.len())?;
+    if row_offset[0] != 0 || row_offset.windows(2).any(|w| w[1] < w[0] || (w[1] - w[0]) as usize > shape.chunk_k_max) {
+        return Err(CudaCppError::message("chunk_row_offset must start at 0, be non-decreasing, and step by at most k_max"));
+    }
+    let total = row_offset[shape.input_size] as usize * shape.chunk_size;
+    if total != shape.l0w_compact_len {
+        return Err(CudaCppError::message(format!(
+            "chunk_row_offset total {} x chunk_size {} = {} != shape.l0w_compact_len {}",
+            row_offset[shape.input_size], shape.chunk_size, total, shape.l0w_compact_len
+        )));
+    }
+    Ok(())
+}
+
+fn opt_i32_buffer_ptr(buffer: &Option<I32Buffer>) -> *const ffi::BulletOuCudaCppI32Buffer {
+    buffer.as_ref().map_or(std::ptr::null(), |b| b.as_ptr() as *const ffi::BulletOuCudaCppI32Buffer)
+}
+
 fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
     let has_common_shard_marker = shape.l1_common_size != 0 || shape.l1_shard_size != 0;
     let expected_axis_stacks =
@@ -5682,6 +5774,18 @@ fn validate_sfnn_shape(shape: SfnnForwardShape) -> Result<()> {
         || shape.ft_size % 2 != 0
     {
         Err(CudaCppError::message(format!("SFNN shape dimensions are invalid: {shape:?}")))
+    } else if shape.chunk_size > 0
+        && (shape.block_rows != 1
+            || shape.chunk_size % 32 != 0
+            || shape.ft_size % shape.chunk_size != 0
+            || shape.chunk_k_max == 0
+            || shape.chunk_k_max > shape.ft_size / shape.chunk_size
+            || shape.l0w_compact_len == 0
+            || shape.l0w_compact_len % shape.chunk_size != 0)
+    {
+        Err(CudaCppError::message(format!(
+            "SFNN chunk layout shape is invalid (need block_rows == 1, chunk_size % 32 == 0, ft % chunk_size == 0, 1 <= k_max <= n_chunks, compact len): {shape:?}"
+        )))
     } else if shape.block_rows == 0
         || (shape.block_rows > 1
             && (shape.ft_size % (2 * shape.block_rows) != 0 || (shape.ft_size / (2 * shape.block_rows)) % 32 != 0))
@@ -6322,6 +6426,12 @@ mod ffi {
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
             block_rows: usize,
+            chunk_size: usize,
+            chunk_k_max: usize,
+            chunk_slots: *const BulletOuCudaCppI32Buffer,
+            chunk_kidx: *const BulletOuCudaCppI32Buffer,
+            chunk_row_offset: *const BulletOuCudaCppI32Buffer,
+            l0w_len: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6376,6 +6486,12 @@ mod ffi {
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
             block_rows: usize,
+            chunk_size: usize,
+            chunk_k_max: usize,
+            chunk_slots: *const BulletOuCudaCppI32Buffer,
+            chunk_kidx: *const BulletOuCudaCppI32Buffer,
+            chunk_row_offset: *const BulletOuCudaCppI32Buffer,
+            l0w_len: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6447,6 +6563,12 @@ mod ffi {
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
             block_rows: usize,
+            chunk_size: usize,
+            chunk_k_max: usize,
+            chunk_slots: *const BulletOuCudaCppI32Buffer,
+            chunk_kidx: *const BulletOuCudaCppI32Buffer,
+            chunk_row_offset: *const BulletOuCudaCppI32Buffer,
+            l0w_len: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6519,6 +6641,12 @@ mod ffi {
             factorizer_king_axis_dim: usize,
             factorizer_hand_axis_dim: usize,
             block_rows: usize,
+            chunk_size: usize,
+            chunk_k_max: usize,
+            chunk_slots: *const BulletOuCudaCppI32Buffer,
+            chunk_kidx: *const BulletOuCudaCppI32Buffer,
+            chunk_row_offset: *const BulletOuCudaCppI32Buffer,
+            l0w_len: usize,
             batch: usize,
             max_active: usize,
             stm_indices: *mut BulletOuCudaCppI32Buffer,
@@ -6694,6 +6822,9 @@ mod tests {
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
             block_rows: 1,
+            chunk_size: 0,
+            chunk_k_max: 0,
+            l0w_compact_len: 0,
         };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
@@ -6721,6 +6852,9 @@ mod tests {
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
             block_rows: 1,
+            chunk_size: 0,
+            chunk_k_max: 0,
+            l0w_compact_len: 0,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 3);
 
@@ -6759,6 +6893,9 @@ mod tests {
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
             block_rows: 1,
+            chunk_size: 0,
+            chunk_k_max: 0,
+            l0w_compact_len: 0,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -6785,6 +6922,9 @@ mod tests {
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
             block_rows: 1,
+            chunk_size: 0,
+            chunk_k_max: 0,
+            l0w_compact_len: 0,
         };
         let layout = SfnnBackwardWorkspaceLayout::new(shape, 5, 40);
 
@@ -6808,6 +6948,9 @@ mod tests {
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
             block_rows: 1,
+            chunk_size: 0,
+            chunk_k_max: 0,
+            l0w_compact_len: 0,
         };
         let c0_layout = SfnnBackwardWorkspaceLayout::new(c0_shape, 5, 40);
 
@@ -7219,40 +7362,145 @@ mod tests {
         assert_eq!(staged_i.download(&ctx).unwrap(), vec![3, 4, 5]);
     }
 
-    /// ブロック疎 FT (task#92): compact l0w (B=2) の forward / backward / 1 step が、足跡の外を 0 にした密 l0w (B=1) と一致する
-    /// (密側の足跡外の勾配・更新は比較しない)。
+    /// 行レイアウトの仕様 (テスト用): 行 f が持つ dense chunk (slot) 列。`block_rows > 1` のときはカーネルを旧分割モードで走らせ
+    /// (表なし)、chunks_of は分割と同じ集合 [b, B + b] を返す (chunk_size = ft/(2B))。それ以外は chunk 表モード。
+    struct LayoutSpec {
+        chunk_size: usize,
+        block_rows: usize,
+        chunks_of: Box<dyn Fn(usize) -> Vec<usize>>,
+    }
+
+    fn block_spec(ft: usize, b_count: usize, virtual_base: usize) -> LayoutSpec {
+        LayoutSpec {
+            chunk_size: ft / (2 * b_count),
+            block_rows: b_count,
+            chunks_of: Box::new(move |f: usize| {
+                let g = if virtual_base > 0 && f >= virtual_base { f - virtual_base } else { f };
+                let b = (g % 1629) % b_count;
+                vec![b, b_count + b]
+            }),
+        }
+    }
+
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// 散布: 行の鍵 (KA2 / 仮想行 = piece_sq、threat 行 = index) からハッシュで前半・後半に k_per_half 個ずつ chunk を選ぶ。
+    /// `ka2_dense` なら KA2 行 (< ka2_rows) と仮想行は全 chunk (= threat 行だけ散布 = narrow の一般化)。
+    fn scatter_spec(
+        ft: usize,
+        chunk_size: usize,
+        k_per_half: usize,
+        virtual_base: usize,
+        ka2_rows: usize,
+        ka2_dense: bool,
+    ) -> LayoutSpec {
+        let n_chunks = ft / chunk_size;
+        let per_half = n_chunks / 2;
+        assert!(k_per_half <= per_half);
+        LayoutSpec {
+            chunk_size,
+            block_rows: 1,
+            chunks_of: Box::new(move |f: usize| {
+                let is_virtual = virtual_base > 0 && f >= virtual_base;
+                let is_ka2 = f < ka2_rows || is_virtual;
+                if ka2_dense && is_ka2 {
+                    return (0..n_chunks).collect();
+                }
+                let key = if is_virtual { (f - virtual_base) % 1629 } else if f < ka2_rows { f % 1629 } else { f };
+                let mut out = Vec::with_capacity(2 * k_per_half);
+                for half in 0..2 {
+                    // 部分 Fisher-Yates
+                    let mut pool: Vec<usize> = (0..per_half).collect();
+                    let mut s = splitmix64((key as u64) << 1 | half as u64);
+                    for i in 0..k_per_half {
+                        s = splitmix64(s);
+                        let j = i + (s as usize) % (per_half - i);
+                        pool.swap(i, j);
+                    }
+                    let mut picked: Vec<usize> = pool[..k_per_half].iter().map(|&c| half * per_half + c).collect();
+                    picked.sort_unstable();
+                    out.extend(picked);
+                }
+                out
+            }),
+        }
+    }
+
+    /// 旧分割 (B=2、小さい入力)。
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sfnn_block_rows_matches_dense_gpu() {
-        sfnn_block_rows_matches_dense_gpu_impl(8, 0);
+        sfnn_layout_matches_dense_gpu_impl(8, 0, 128, block_spec(128, 2, 0));
     }
 
-    /// 同上を halfka2 の factorized 実サイズ (131,949 + 仮想行 1,629) で: 仮想行 (BASE 相対のブロック) の暗黙射影・reduce と、
+    /// 旧分割を halfka2 の factorized 実サイズ (131,949 + 仮想行 1,629) で: 仮想行 (BASE 相対) の暗黙射影・reduce と、
     /// バッファ長の取り違え (密の長さで fill すると隣を壊す = 09-22 の wide2048b2 の事故) を実サイズで検出する。
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sfnn_block_rows_factorized_matches_dense_gpu() {
-        sfnn_block_rows_matches_dense_gpu_impl(131_949 + 1_629, 131_949);
+        sfnn_layout_matches_dense_gpu_impl(131_949 + 1_629, 131_949, 128, block_spec(128, 2, 131_949));
     }
 
-    /// halfka2t の実サイズ (KA2 131,949 + threat 216,720 + 仮想行 1,629 = 350,298): threat 行 (factorise されない、ブロックは散らし) と
-    /// KA2 行 (仮想行へ射影) が混在する本番の入力空間。
+    /// 旧分割を halfka2t の実サイズ (KA2 131,949 + threat 216,720 + 仮想行 1,629 = 350,298) で。
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sfnn_block_rows_halfka2t_matches_dense_gpu() {
-        sfnn_block_rows_matches_dense_gpu_impl(131_949 + 216_720 + 1_629, 131_949 + 216_720);
+        sfnn_layout_matches_dense_gpu_impl(131_949 + 216_720 + 1_629, 131_949 + 216_720, 128, block_spec(128, 2, 131_949 + 216_720));
     }
 
-    /// `virtual_base` = 0 なら仮想行なし。仮想行 v ≥ virtual_base のブロックは (v − virtual_base) 相対 (CUDA sfnn_block_of と同じ)。
-    fn sfnn_block_rows_matches_dense_gpu_impl(input_size: usize, virtual_base: usize) {
-        let ft = 128usize;
-        let b_count = 2usize;
-        let block_of = |f: usize| -> usize {
-            let g = if virtual_base > 0 && f >= virtual_base { f - virtual_base } else { f };
-            (g % 1629) % b_count
-        };
-        let n = ft / (2 * b_count);
-        let stride = ft / b_count;
+    /// chunk 表モード (小さい入力): 全行が 4 chunk 中 2 (前後半 1 ずつ) をハッシュで持つ。
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_chunk_scatter_small_gpu() {
+        sfnn_layout_matches_dense_gpu_impl(8, 0, 128, scatter_spec(128, 32, 1, 0, 0, false));
+    }
+
+    /// threat 行だけ散布 (narrow の一般化): halfka2t 実サイズ、KA2 行と仮想行は全 4 chunk (密)、threat 行は前後半 1 ずつ = 行ごと可変長。
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_chunk_threat_scatter_halfka2t_gpu() {
+        let vb = 131_949 + 216_720;
+        sfnn_layout_matches_dense_gpu_impl(vb + 1_629, vb, 128, scatter_spec(128, 32, 1, vb, 131_949, true));
+    }
+
+    /// 全行散布 (幅 2 倍相当): halfka2t 実サイズ、ft 256 を 8 chunk に切り全行が前後半 2 ずつ (密度 1/2)、仮想行は piece_sq で射影元と同じ集合。
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_chunk_scatter_wide_halfka2t_gpu() {
+        let vb = 131_949 + 216_720;
+        sfnn_layout_matches_dense_gpu_impl(vb + 1_629, vb, 256, scatter_spec(256, 32, 2, vb, 131_949, false));
+    }
+
+    /// compact l0w (分割 / chunk 表) の forward / backward 両経路 / 1 step が、足跡の外を 0 にした密 l0w と一致する
+    /// (密側の足跡外の勾配・更新は比較しない)。`virtual_base` = 0 なら仮想行なし。
+    fn sfnn_layout_matches_dense_gpu_impl(input_size: usize, virtual_base: usize, ft: usize, spec: LayoutSpec) {
+        let cs = spec.chunk_size;
+        let n_chunks = ft / cs;
+        let rows: Vec<Vec<usize>> = (0..input_size).map(|f| (spec.chunks_of)(f)).collect();
+        let k_max = rows.iter().map(|r| r.len()).max().unwrap();
+        let mut row_offset = vec![0i32; input_size + 1];
+        for f in 0..input_size {
+            row_offset[f + 1] = row_offset[f] + rows[f].len() as i32;
+        }
+        let total_len = row_offset[input_size] as usize * cs;
+        let row_base = |f: usize| -> usize { row_offset[f] as usize * cs };
+        let mut slots: Vec<i32> = Vec::with_capacity(input_size * k_max);
+        let mut kidx: Vec<i32> = Vec::with_capacity(input_size * n_chunks);
+        for r in rows.iter() {
+            for k in 0..k_max {
+                slots.push(if k < r.len() { r[k] as i32 } else { -1 });
+            }
+            for slot in 0..n_chunks {
+                kidx.push(r.iter().position(|&c| c == slot).map_or(-1, |k| k as i32));
+            }
+        }
+        let table_mode = spec.block_rows <= 1;
         let dense_shape = SfnnForwardShape {
             input_size,
             ft_size: ft,
@@ -7265,8 +7513,18 @@ mod tests {
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
             block_rows: 1,
+            chunk_size: 0,
+            chunk_k_max: 0,
+            l0w_compact_len: 0,
         };
-        let compact_shape = SfnnForwardShape { block_rows: b_count, ..dense_shape };
+        let compact_shape = if table_mode {
+            SfnnForwardShape { chunk_size: cs, chunk_k_max: k_max, l0w_compact_len: total_len, ..dense_shape }
+        } else {
+            SfnnForwardShape { block_rows: spec.block_rows, ..dense_shape }
+        };
+        if !table_mode {
+            assert_eq!(total_len, input_size * (ft / spec.block_rows));
+        }
         let mut seed = 0x1234_5678u32;
         let mut rnd = move |scale: f32| {
             seed ^= seed << 13;
@@ -7274,26 +7532,30 @@ mod tests {
             seed ^= seed << 5;
             ((seed % 2001) as f32 - 1000.0) / 1000.0 * scale
         };
-        let compact: Vec<f32> = (0..input_size * stride).map(|_| rnd(0.5)).collect();
-        let mut dense = vec![0.0f32; input_size * ft];
-        for f in 0..input_size {
-            let b = block_of(f);
-            for j in 0..n {
-                dense[f * ft + b * n + j] = compact[f * stride + j];
-                dense[f * ft + ft / 2 + b * n + j] = compact[f * stride + n + j];
-            }
-        }
-        let compact_of = |dense_l0w: &[f32]| -> Vec<f32> {
-            let mut out = vec![0.0f32; input_size * stride];
+        let compact: Vec<f32> = (0..total_len).map(|_| rnd(0.5)).collect();
+        let expand = |compact_l0w: &[f32]| -> Vec<f32> {
+            let mut dense = vec![0.0f32; input_size * ft];
             for f in 0..input_size {
-                let b = block_of(f);
-                for j in 0..n {
-                    out[f * stride + j] = dense_l0w[f * ft + b * n + j];
-                    out[f * stride + n + j] = dense_l0w[f * ft + ft / 2 + b * n + j];
+                for (k, &slot) in rows[f].iter().enumerate() {
+                    for j in 0..cs {
+                        dense[f * ft + slot * cs + j] = compact_l0w[row_base(f) + k * cs + j];
+                    }
+                }
+            }
+            dense
+        };
+        let compact_of = |dense_l0w: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; total_len];
+            for f in 0..input_size {
+                for (k, &slot) in rows[f].iter().enumerate() {
+                    for j in 0..cs {
+                        out[row_base(f) + k * cs + j] = dense_l0w[f * ft + slot * cs + j];
+                    }
                 }
             }
             out
         };
+        let dense = expand(&compact);
         let l1_out = dense_shape.l1_out();
         let other: [Vec<f32>; 7] = [
             (0..ft).map(|_| rnd(0.1)).collect(),
@@ -7304,7 +7566,12 @@ mod tests {
             (0..dense_shape.num_stacks * dense_shape.l2_size).map(|_| rnd(0.3)).collect(),
             (0..dense_shape.num_stacks).map(|_| rnd(0.1)).collect(),
         ];
-        fn mk<'a>(shape: SfnnForwardShape, l0w: &'a [f32], o: &'a [Vec<f32>; 7]) -> SfnnForwardHostWeights<'a> {
+        struct Tables<'a> {
+            slots: Option<&'a [i32]>,
+            kidx: Option<&'a [i32]>,
+            row_offset: Option<&'a [i32]>,
+        }
+        fn mk<'a>(shape: SfnnForwardShape, l0w: &'a [f32], o: &'a [Vec<f32>; 7], t: Tables<'a>) -> SfnnForwardHostWeights<'a> {
             SfnnForwardHostWeights {
                 shape,
                 l0w,
@@ -7327,6 +7594,9 @@ mod tests {
                 l3fb: None,
                 l3axw: None,
                 l3axb: None,
+                chunk_slots: t.slots,
+                chunk_kidx: t.kidx,
+                chunk_row_offset: t.row_offset,
             }
         }
         // 特徴 (k, p): 小さい入力では p だけ、factorized 実サイズでは king k の行 k*1629 + p (< 131,949 = 仮想行の射影元)。
@@ -7338,7 +7608,7 @@ mod tests {
         let mut stm_vec: Vec<i32> = stm_raw.iter().enumerate().map(|(i, &p)| feat(kings[i / 3], p)).collect();
         let mut nstm_vec: Vec<i32> = nstm_raw.iter().enumerate().map(|(i, &p)| feat(kings[(i / 3 + 1) % 4], p)).collect();
         if virtual_base > 131_949 {
-            // halfka2t: threat 行 (131,949..virtual_base) も混ぜる (両ブロック、仮想行への射影なし)
+            // halfka2t: threat 行 (131,949..virtual_base) も混ぜる (仮想行への射影なし)
             let threat = |t: usize| -> i32 { (131_949 + t) as i32 };
             stm_vec[2] = threat(0);
             stm_vec[7] = threat(1);
@@ -7423,81 +7693,70 @@ mod tests {
             let stepped = runner.read_weights(&ctx).unwrap();
             (output, plain, train, stepped)
         };
-        let (out_d, plain_d, train_d, step_d) = run(mk(dense_shape, &dense, &other));
-        let (out_c, plain_c, train_c, step_c) = run(mk(compact_shape, &compact, &other));
+        let none = Tables { slots: None, kidx: None, row_offset: None };
+        let tables = if table_mode {
+            Tables { slots: Some(&slots), kidx: Some(&kidx), row_offset: Some(&row_offset) }
+        } else {
+            Tables { slots: None, kidx: None, row_offset: None }
+        };
+        let (out_d, plain_d, train_d, step_d) = run(mk(dense_shape, &dense, &other, none));
+        let (out_c, plain_c, train_c, step_c) = run(mk(compact_shape, &compact, &other, tables));
 
-        assert_close_slice("block output", &out_c, &out_d, 1.0e-5);
-        assert_eq!(plain_c.l0w_gradients.len(), input_size * stride);
         // 診断: どの行領域がどれだけ食い違うか (KA2 / threat / 仮想行) を先に出す
         let summarize = |label: &str, got: &[f32], want: &[f32]| {
-            let mut rows: std::collections::BTreeMap<usize, (usize, f32)> = std::collections::BTreeMap::new();
+            let mut bad: std::collections::BTreeMap<usize, (usize, f32)> = std::collections::BTreeMap::new();
+            let mut f = 0usize;
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                while f + 1 < input_size && row_base(f + 1) <= i {
+                    f += 1;
+                }
                 if (g - w).abs() > 1.0e-6 {
-                    let e = rows.entry(i / stride).or_insert((0, 0.0));
+                    let e = bad.entry(f).or_insert((0, 0.0));
                     e.0 += 1;
                     e.1 = e.1.max((g - w).abs());
                 }
             }
-            if !rows.is_empty() {
-                eprintln!("{label}: {} mismatching rows", rows.len());
-                for (r, (cnt, mx)) in rows.iter().take(12) {
+            if !bad.is_empty() {
+                eprintln!("{label}: {} mismatching rows", bad.len());
+                for (r, (cnt, mx)) in bad.iter().take(12) {
                     let region = if virtual_base > 0 && *r >= virtual_base { "virtual" } else if *r >= 131_949 && virtual_base > 131_949 { "threat" } else { "ka2" };
-                    eprintln!("  row {r} ({region}, block {}): {cnt} cols, max diff {mx:.3e}", block_of(*r));
+                    eprintln!("  row {r} ({region}, chunks {:?}): {cnt} cols, max diff {mx:.3e}", rows[*r]);
                 }
             }
         };
+        assert_close_slice("layout output", &out_c, &out_d, 1.0e-5);
+        assert_eq!(plain_c.l0w_gradients.len(), total_len);
         summarize("plain l0w_grad", &plain_c.l0w_gradients, &compact_of(&plain_d.l0w_gradients));
         summarize("train l0w_grad", &train_c.l0w_gradients, &compact_of(&train_d.l0w_gradients));
-        if virtual_base > 0 {
-            // 仮想行 p=0 の詳細: compact の 64 値 / 密の自ブロック列 / 密の他ブロック列 / 密の KA2 行 (k=0,p=0) の自ブロック列
-            let v = virtual_base;
-            let b = block_of(v);
-            let ob = 1 - b;
-            let dense_row = |r: usize, blk: usize| -> Vec<f32> {
-                let mut out = Vec::new();
-                for j in 0..n { out.push(plain_d.l0w_gradients[r * ft + blk * n + j]); }
-                for j in 0..n { out.push(plain_d.l0w_gradients[r * ft + ft / 2 + blk * n + j]); }
-                out
-            };
-            let cvals = &plain_c.l0w_gradients[v * stride..(v + 1) * stride];
-            eprintln!("virtual row {v} block {b}: compact[0..8]      = {:?}", &cvals[..8]);
-            eprintln!("virtual row {v} block {b}: dense same-block   = {:?}", &dense_row(v, b)[..8]);
-            eprintln!("virtual row {v} block {b}: dense other-block  = {:?}", &dense_row(v, ob)[..8]);
-            eprintln!("ka2 row 0 (k=0,p=0) block {}: compact[0..8]   = {:?}", block_of(0), &plain_c.l0w_gradients[0..8]);
-            eprintln!("ka2 row 0 (k=0,p=0): dense same-block         = {:?}", &dense_row(0, block_of(0))[..8]);
-            let k80 = 80 * 1629;
-            eprintln!("ka2 row {k80} (k=80,p=0): compact[0..8]      = {:?}", &plain_c.l0w_gradients[k80 * stride..k80 * stride + 8]);
-            eprintln!("ka2 row {k80} (k=80,p=0): dense same-block    = {:?}", &dense_row(k80, block_of(k80))[..8]);
-        }
-        assert_close_slice("block l0w_grad", &plain_c.l0w_gradients, &compact_of(&plain_d.l0w_gradients), 1.0e-6);
-        assert_close_slice("block l0b_grad", &plain_c.l0b_gradients, &plain_d.l0b_gradients, 1.0e-6);
-        assert_close_slice("block stm_l0_grad", &plain_c.stm_l0_gradients, &plain_d.stm_l0_gradients, 1.0e-6);
-        assert_close_slice("block nstm_l0_grad", &plain_c.nstm_l0_gradients, &plain_d.nstm_l0_gradients, 1.0e-6);
-        assert_close_slice("block l1w_grad", &plain_c.l1w_gradients, &plain_d.l1w_gradients, 1.0e-6);
-        assert_close_slice("block l1b_grad", &plain_c.l1b_gradients, &plain_d.l1b_gradients, 1.0e-6);
-        assert_close_slice("block l2w_grad", &plain_c.l2w_gradients, &plain_d.l2w_gradients, 1.0e-6);
-        assert_close_slice("block l3w_grad", &plain_c.l3w_gradients, &plain_d.l3w_gradients, 1.0e-6);
-        assert_close_slice("block train l0w_grad", &train_c.l0w_gradients, &compact_of(&train_d.l0w_gradients), 1.0e-6);
-        assert_close_slice("block train l0b_grad", &train_c.l0b_gradients, &train_d.l0b_gradients, 1.0e-6);
-        assert_close_slice("block train l1w_grad", &train_c.l1w_gradients, &train_d.l1w_gradients, 1.0e-6);
-        assert_close_slice("block train l2w_grad", &train_c.l2w_gradients, &train_d.l2w_gradients, 1.0e-6);
-        assert_eq!(step_c.l0w.len(), input_size * stride);
-        assert_close_slice("block step l0w", &step_c.l0w, &compact_of(&step_d.l0w), 1.0e-6);
-        assert_close_slice("block step l0b", &step_c.l0b, &step_d.l0b, 1.0e-6);
-        assert_close_slice("block step l1w", &step_c.l1w, &step_d.l1w, 1.0e-6);
-        assert_close_slice("block step l2w", &step_c.l2w, &step_d.l2w, 1.0e-6);
-        // the dense run does move weights outside the footprint (they had a non-zero gradient); the block run cannot
+        assert_close_slice("layout l0w_grad", &plain_c.l0w_gradients, &compact_of(&plain_d.l0w_gradients), 1.0e-6);
+        assert_close_slice("layout l0b_grad", &plain_c.l0b_gradients, &plain_d.l0b_gradients, 1.0e-6);
+        assert_close_slice("layout stm_l0_grad", &plain_c.stm_l0_gradients, &plain_d.stm_l0_gradients, 1.0e-6);
+        assert_close_slice("layout nstm_l0_grad", &plain_c.nstm_l0_gradients, &plain_d.nstm_l0_gradients, 1.0e-6);
+        assert_close_slice("layout l1w_grad", &plain_c.l1w_gradients, &plain_d.l1w_gradients, 1.0e-6);
+        assert_close_slice("layout l1b_grad", &plain_c.l1b_gradients, &plain_d.l1b_gradients, 1.0e-6);
+        assert_close_slice("layout l2w_grad", &plain_c.l2w_gradients, &plain_d.l2w_gradients, 1.0e-6);
+        assert_close_slice("layout l3w_grad", &plain_c.l3w_gradients, &plain_d.l3w_gradients, 1.0e-6);
+        assert_close_slice("layout train l0w_grad", &train_c.l0w_gradients, &compact_of(&train_d.l0w_gradients), 1.0e-6);
+        assert_close_slice("layout train l0b_grad", &train_c.l0b_gradients, &train_d.l0b_gradients, 1.0e-6);
+        assert_close_slice("layout train l1w_grad", &train_c.l1w_gradients, &train_d.l1w_gradients, 1.0e-6);
+        assert_close_slice("layout train l2w_grad", &train_c.l2w_gradients, &train_d.l2w_gradients, 1.0e-6);
+        assert_eq!(step_c.l0w.len(), total_len);
+        assert_close_slice("layout step l0w", &step_c.l0w, &compact_of(&step_d.l0w), 1.0e-6);
+        assert_close_slice("layout step l0b", &step_c.l0b, &step_d.l0b, 1.0e-6);
+        assert_close_slice("layout step l1w", &step_c.l1w, &step_d.l1w, 1.0e-6);
+        assert_close_slice("layout step l2w", &step_c.l2w, &step_d.l2w, 1.0e-6);
+        // the dense run does move weights outside the footprint (they had a non-zero gradient); the compact run cannot.
+        // (rows that keep every chunk have no outside, so only count rows with a real footprint)
         let moved_outside = (0..input_size * ft)
             .filter(|&i| {
                 let f = i / ft;
-                let col = i % ft;
-                let b = block_of(f);
-                let c = if col >= ft / 2 { col - ft / 2 } else { col };
-                let inside = c >= b * n && c < b * n + n;
-                !inside && step_d.l0w[i] != 0.0
+                let slot = (i % ft) / cs;
+                !rows[f].contains(&slot) && step_d.l0w[i] != 0.0
             })
             .count();
-        assert!(moved_outside > 0, "test setup: the dense reference should touch out-of-footprint weights");
+        if rows.iter().any(|r| r.len() < n_chunks) {
+            assert!(moved_outside > 0, "test setup: the dense reference should touch out-of-footprint weights");
+        }
     }
 
     fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static> {
@@ -7541,6 +7800,9 @@ mod tests {
             factorizer_king_axis_dim: 0,
             factorizer_hand_axis_dim: 0,
             block_rows: 1,
+            chunk_size: 0,
+            chunk_k_max: 0,
+            l0w_compact_len: 0,
         }
     }
 
@@ -7593,6 +7855,9 @@ mod tests {
             l3fb: Some(&[0.004]),
             l3axw: None,
             l3axb: None,
+            chunk_slots: None,
+            chunk_kidx: None,
+            chunk_row_offset: None,
         }
     }
 
