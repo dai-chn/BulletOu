@@ -6243,6 +6243,13 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         colored_positions(positions),
         colored_pos_s(positions_per_sec)
     );
+    // staging 上書き競合 (report/52 §21.17) の露出度: 修正前ならこの回数だけ GPU が別の batch を学習していた
+    eprintln!(
+        "  cuda-cpp NNUE upload staging waits = {} / {} steps ({:.1}%)",
+        runner.upload_staging_waits(),
+        seen_steps,
+        100.0 * runner.upload_staging_waits() as f64 / seen_steps.max(1) as f64
+    );
     if profile_count > 0 {
         let denom = profile_count as f64;
         eprintln!(
@@ -7333,6 +7340,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         paint("ok", ConsoleColor::BoldGreen),
         colored_positions(positions),
         colored_pos_s(positions_per_sec)
+    );
+    // staging 上書き競合 (report/52 §21.17) の露出度: 修正前ならこの回数だけ GPU が別の batch を学習していた
+    eprintln!(
+        "  cuda-cpp SFNN upload staging waits = {} / {} steps ({:.1}%)",
+        runner.upload_staging_waits(),
+        seen_steps,
+        100.0 * runner.upload_staging_waits() as f64 / seen_steps.max(1) as f64
     );
     if profile_count > 0 {
         let denom = profile_count as f64;

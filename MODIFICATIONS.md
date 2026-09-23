@@ -201,3 +201,21 @@ classic 512 で ThreatEffect (長/短利き数バケット、26,244 次元) が 
   `set_l0w_column_mask` (l0w と lookahead slow_params に即時適用)、`update_weights` で l0w の Ranger 更新直後に再適用。
 - `examples/bulletou.rs`: `--threat-slice-cols N` (SFNN halfka2t 専用)。threat 行 [131,949, 348,669) の FT 重みを pairwise 前半 [0,N) と
   後半 [ft/2, ft/2+N) の列に限る。export は既存フォーマット (全幅、マスク外 0) なので YaneuraOu 側は無改修で動く。
+
+## 🔴 訓練 upload pipeline の staging 上書き競合の修正 (2026-09-23, report/52 §21.17)
+
+- 症状: 同データ・同引数・同 init でも、loss の軌跡が走行ごとに「良い族」「悪い族」に分かれ、何も読み書きしない no-op kernel
+  (identity mask `--threat-slice-cols ft/2`) を挟むだけで族が変わる。同期経路 (`--cuda-cpp-profile-steps`、`CUDA_LAUNCH_BLOCKING=1`)
+  は決定的で「悪い族」= 本来の計算。別マシン (vast RTX A4000, Linux) でも再現 = コードの欠陥。
+- 原因: `NnueTrainStepUploadSlot::upload` / `SfnnTrainStepUploadSlot::upload` (2 slot の非同期 H2D、2026-07-28 の hot path 最適化) が
+  pinned staging へホスト memcpy → `cudaMemcpyAsync` の順で積むが、**前回この slot から積んだ H2D の完了をホストで待っていなかった**。
+  ホストが GPU より 2 step 以上先行すると (GPU 律速・または loader のバースト)、GPU がまだ読んでいない staging を次の batch で上書きし、
+  GPU は別の (後の/重複した/混合した) batch を学習していた。loss は「直前に学習した batch」で測られるので見かけ上 1.4〜3 倍低くなる。
+- 修正: `upload()` で `in_use` のとき `upload_ready.synchronize()` (前回の H2D 完了をホストで待つ) を `compute_done.wait` の前に追加。
+  修正後は pipelined = 同期経路と 4 桁一致 (0.02782 / 0.01990 / 0.01492 @500/1000/2000、halfka2t 1024 quiet-tsfnn)。
+  スループット −5% (200k → 190k pos/s)。
+- 診断: `Event::is_complete` (`bulletou_cuda_cpp_event_query`) と slot の `staging_waits` カウンタ、`SfnnTrainStepRunner::upload_staging_waits`。
+  訓練終了時に `cuda-cpp SFNN upload staging waits = N / steps (x%)` を出す (修正前ならこの回数だけ競合していた)。
+- `crates/cuda_cpp/build.rs`: `BULLETOU_CUDA_ARCH=sm_120` で `-arch=` を指定できる (既定は nvcc 既定 sm_52 + JIT。切り分けで JIT は無関係と確認)。
+- 含意: 2026-07-28 以降の cuda-cpp 訓練の loss 曲線は競合の露出度に依存して楽観的で、走行間の loss 比較は無効だったものがある
+  (report/52 §21.15 の分割 NO-GO 3〜4 倍など)。ネットの強さは対局で判定した分だけ有効。

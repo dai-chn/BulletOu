@@ -5154,6 +5154,27 @@ extern "C" int bulletou_cuda_cpp_event_synchronize(BulletOuCudaCppEvent* event) 
     return ok();
 }
 
+// Non-blocking completion query (2026-09-23): out_complete = 1 if all work recorded before the event has finished.
+extern "C" int bulletou_cuda_cpp_event_query(BulletOuCudaCppEvent* event, int* out_complete) {
+    if (event == nullptr || event->event == nullptr || out_complete == nullptr) {
+        return fail_message("event_query event/out must not be null");
+    }
+    cudaError_t status = cudaSetDevice(event->device);
+    if (status != cudaSuccess) {
+        return fail("cudaSetDevice", status);
+    }
+    status = cudaEventQuery(event->event);
+    if (status == cudaSuccess) {
+        *out_complete = 1;
+        return ok();
+    }
+    if (status == cudaErrorNotReady) {
+        *out_complete = 0;
+        return ok();
+    }
+    return fail("cudaEventQuery", status);
+}
+
 extern "C" int bulletou_cuda_cpp_event_elapsed_ms(
     BulletOuCudaCppEvent* start,
     BulletOuCudaCppEvent* stop,

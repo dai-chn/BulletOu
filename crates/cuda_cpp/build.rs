@@ -44,6 +44,14 @@ fn main() {
     build.file("cpp/bulletou_cuda_backend.cu");
     build.flag("-std=c++17");
     build.flag("-O3");
+    // GPU アーキテクチャ: 既定 (指定なし) は nvcc 既定の sm_52 SASS + compute_52 PTX で、実行時にドライバが JIT する。
+    // BULLETOU_CUDA_ARCH=sm_120 のように指定すると `-arch=<値>` で実機 SASS を埋め込む (JIT 経路の切り分け用、2026-09-23 report/52 §21.17)。
+    println!("cargo:rerun-if-env-changed=BULLETOU_CUDA_ARCH");
+    if let Ok(arch) = env::var("BULLETOU_CUDA_ARCH") {
+        if !arch.trim().is_empty() {
+            build.flag(&format!("-arch={}", arch.trim()));
+        }
+    }
     // ★--use_fast_math は外した (shogi-nnue fork)。
     //   bullet-shogi はこのフラグ無しでビルドされており、パリティ照合で
     //   同一レシピの損失が +11% 劣化する差の候補として検証するため。

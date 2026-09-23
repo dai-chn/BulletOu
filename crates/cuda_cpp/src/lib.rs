@@ -108,6 +108,14 @@ impl Event {
         check(unsafe { ffi::bulletou_cuda_cpp_event_synchronize(self.raw.as_ptr()) })
     }
 
+    /// 記録済みの仕事が全部終わっていれば true (ブロックしない)。
+    pub fn is_complete(&self) -> Result<bool> {
+        let mut out = 0i32;
+        // SAFETY: `self.raw` is valid until Drop; `out` is a valid out pointer.
+        check(unsafe { ffi::bulletou_cuda_cpp_event_query(self.raw.as_ptr(), &mut out) })?;
+        Ok(out != 0)
+    }
+
     pub fn elapsed_ms_since(&self, start: &Event) -> Result<f32> {
         let mut out = 0.0;
         // SAFETY: both events are valid and `out` is a valid out pointer.
@@ -4424,6 +4432,8 @@ pub struct NnueTrainStepUploadSlot {
     upload_ready: Event,
     compute_done: Event,
     in_use: bool,
+    /// staging を再利用しようとした時点で前回の H2D がまだ終わっていなかった回数 (= 修正前なら競合していた回数、report/52 §21.17)。
+    pub staging_waits: u64,
 }
 
 impl NnueTrainStepUploadSlot {
@@ -4453,6 +4463,7 @@ impl NnueTrainStepUploadSlot {
             upload_ready: Event::new(ctx)?,
             compute_done: Event::new(ctx)?,
             in_use: false,
+            staging_waits: 0,
         })
     }
 
@@ -4465,6 +4476,14 @@ impl NnueTrainStepUploadSlot {
             )));
         }
         if self.in_use {
+            // 🔴 staging (pinned) の上書き競合 (2026-09-23, report/52 §21.17): 下の upload_to_device はホスト側で staging に memcpy
+            // してから cudaMemcpyAsync を積む。ホストが GPU より 2 step 以上先行すると、前回このスロットから積んだ H2D がまだ
+            // 実行されていないうちに staging を次の batch で上書きし、GPU は別の (後の) batch を学習する = batch の重複/欠落/混合。
+            // upload_ready は前回の H2D の直後に記録されているので、それをホストで待ってから staging に触る。
+            if !self.upload_ready.is_complete()? {
+                self.staging_waits += 1;
+                self.upload_ready.synchronize()?;
+            }
             self.compute_done.wait(upload_ctx)?;
         }
         self.pinned_stm_indices.upload_to_device(upload_ctx, &self.device_batch.stm_indices, batch.stm_indices)?;
@@ -4819,6 +4838,11 @@ impl NnueTrainStepRunner {
         self.loss_workspace.download(ctx)
     }
 
+    /// upload slot の staging 再利用でホストが待った回数の合計 (修正前なら競合していた回数、report/52 §21.17)。
+    pub fn upload_staging_waits(&self) -> u64 {
+        self.upload_slots.iter().map(|slot| slot.staging_waits).sum()
+    }
+
     pub fn read_weights(&self, ctx: &Context) -> Result<NnueTrainWeightsReadback> {
         Ok(NnueTrainWeightsReadback {
             l0w: self.weights.l0w.download(ctx)?,
@@ -4978,6 +5002,8 @@ pub struct SfnnTrainStepUploadSlot {
     upload_ready: Event,
     compute_done: Event,
     in_use: bool,
+    /// staging を再利用しようとした時点で前回の H2D がまだ終わっていなかった回数 (= 修正前なら競合していた回数、report/52 §21.17)。
+    pub staging_waits: u64,
 }
 
 impl SfnnTrainStepUploadSlot {
@@ -5009,6 +5035,7 @@ impl SfnnTrainStepUploadSlot {
             upload_ready: Event::new(ctx)?,
             compute_done: Event::new(ctx)?,
             in_use: false,
+            staging_waits: 0,
         })
     }
 
@@ -5021,6 +5048,12 @@ impl SfnnTrainStepUploadSlot {
             )));
         }
         if self.in_use {
+            // 🔴 staging 上書き競合の防止 (NnueTrainStepUploadSlot::upload と同じ、2026-09-23 report/52 §21.17):
+            // 前回この slot から積んだ H2D (upload_ready) の完了をホストで待ってから staging に memcpy する。
+            if !self.upload_ready.is_complete()? {
+                self.staging_waits += 1;
+                self.upload_ready.synchronize()?;
+            }
             self.compute_done.wait(upload_ctx)?;
         }
         self.pinned_stm_indices.upload_to_device(upload_ctx, &self.device_batch.stm_indices, batch.stm_indices)?;
@@ -5431,6 +5464,11 @@ impl SfnnTrainStepRunner {
 
     pub fn read_loss(&self, ctx: &Context) -> Result<ScalarLossReadback> {
         self.loss_workspace.download(ctx)
+    }
+
+    /// upload slot の staging 再利用でホストが待った回数の合計 (修正前なら競合していた回数、report/52 §21.17)。
+    pub fn upload_staging_waits(&self) -> u64 {
+        self.upload_slots.iter().map(|slot| slot.staging_waits).sum()
     }
 
     pub fn read_weights(&self, ctx: &Context) -> Result<SfnnTrainWeightsReadback> {
@@ -6139,6 +6177,7 @@ mod ffi {
         ) -> i32;
         pub fn bulletou_cuda_cpp_event_wait(ctx: *mut BulletOuCudaCppContext, event: *mut BulletOuCudaCppEvent) -> i32;
         pub fn bulletou_cuda_cpp_event_synchronize(event: *mut BulletOuCudaCppEvent) -> i32;
+        pub fn bulletou_cuda_cpp_event_query(event: *mut BulletOuCudaCppEvent, out_complete: *mut i32) -> i32;
         pub fn bulletou_cuda_cpp_event_elapsed_ms(
             start: *mut BulletOuCudaCppEvent,
             stop: *mut BulletOuCudaCppEvent,
