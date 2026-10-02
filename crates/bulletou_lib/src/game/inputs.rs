@@ -1,4 +1,5 @@
 mod adapter;
+mod threat_dropout;
 mod ataxx147;
 mod chess768;
 mod chess_buckets;
@@ -28,6 +29,7 @@ pub mod shogi_threat_exclusion;
 mod legacy;
 
 pub use adapter::MarlinFormatAdapter;
+pub use threat_dropout::ThreatDropout;
 pub use ataxx147::{Ataxx98, Ataxx147};
 pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
 pub use chess768::Chess768;

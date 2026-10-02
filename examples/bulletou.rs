@@ -2745,6 +2745,12 @@ struct Args {
     #[arg(long = "threat-slice-blocks", default_value = "1")]
     threat_slice_blocks: usize,
 
+    /// threat dropout (lazy threat A1 の同時学習、report/52 §21.18、cuda-cpp SFNN halfka2t 経路): サンプル単位で確率 p で
+    /// threat 行 (index >= HALFKA2_DIMENSIONS) を全部落として学習し、同じ下流層が KA2 平面だけでも読めるようにする。
+    /// 推論側は threat 平面を落とした値 (nnuedump v3 eval_ka2) を絶対閾値ゲートに使う。nn.bin の形式は不変。0 = 無効。
+    #[arg(long = "threat-dropout", default_value = "0")]
+    threat_dropout: f32,
+
     /// ブロック疎 FT (task#92, spec 2026-09-21-block-sparse-wide-ft-design.md、cuda-cpp SFNN 経路のみ): 行 f は幅 ft の accumulator の
     /// ブロック b(f) = (f mod 1629) mod B (factoriser の仮想行は BASE 相対) の列 [b*N, b*N+N) ∪ [ft/2 + b*N, ...) (N = ft/(2B)) だけを持ち、
     /// l0w はその ft/B 値だけを compact に持つ (state.bin も compact)。YaneuraOu 側は -DNNUE_FT_BLOCK_ROWS=B のビルドで読む。1 = 密。
@@ -6388,6 +6394,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
 #[cfg(feature = "cuda-cpp-backend")]
 fn for_each_cuda_cpp_sfnn_teacher_batch<F>(
     feature_kind: CudaCppSfnnFeatureKind,
+    threat_dropout: f32,
     config: &bulletou_lib::value::SfnnTeacherBatchConfig<'_>,
     batch_count: usize,
     visitor: F,
@@ -6397,6 +6404,9 @@ where
 {
     use bulletou_lib::value::for_each_sfnn_teacher_fast_batch;
 
+    if threat_dropout > 0.0 && feature_kind != CudaCppSfnnFeatureKind::Halfka2Threat {
+        return Err("--threat-dropout は SFNN halfka2t (Halfka2Threat) 経路専用です".to_string());
+    }
     match feature_kind {
         CudaCppSfnnFeatureKind::Halfka1hm => {
             for_each_sfnn_teacher_fast_batch(ShogiHalfKaHm1, feature_kind.input_label(), config, batch_count, visitor)
@@ -6411,7 +6421,18 @@ where
             for_each_sfnn_teacher_fast_batch(ShogiKa2, feature_kind.input_label(), config, batch_count, visitor)
         }
         CudaCppSfnnFeatureKind::Halfka2Threat => {
-            for_each_sfnn_teacher_fast_batch(ShogiHalfKa2Threat, feature_kind.input_label(), config, batch_count, visitor)
+            if threat_dropout > 0.0 {
+                // threat dropout: サンプル単位で threat 行を落とす (--threat-dropout p)。seed はカウンタに xor されるだけ。
+                let input = bulletou_lib::game::inputs::ThreatDropout::new(
+                    ShogiHalfKa2Threat,
+                    bulletou_lib::game::inputs::HALFKA2_DIMENSIONS,
+                    threat_dropout,
+                    0x7468_7265_6174_6421,
+                );
+                for_each_sfnn_teacher_fast_batch(input, feature_kind.input_label(), config, batch_count, visitor)
+            } else {
+                for_each_sfnn_teacher_fast_batch(ShogiHalfKa2Threat, feature_kind.input_label(), config, batch_count, visitor)
+            }
         }
         CudaCppSfnnFeatureKind::Halfka2ThreatDropFact => for_each_sfnn_teacher_fast_batch(
             ShogiHalfKa2ThreatDropFact,
@@ -6776,7 +6797,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     "  cuda-cpp SFNN plateau: epoch={}, superbatch={}, lr {}",
                     chunk.epoch, chunk.superbatch, plateau_state.current_lr
                 );
-                for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &chunk_config, chunk.steps, |teacher_batch| {
+                for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, args.threat_dropout, &chunk_config, chunk.steps, |teacher_batch| {
                     chunk_seen_steps += 1;
                     attempted_steps_total += 1;
                     chunk_last_pos = teacher_batch.dataloader_pos;
@@ -7056,7 +7077,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut checkpoint_chunk_idx = 0usize;
     let mut last_checkpoint_metrics = None;
     let mut deferred_direct_checkpoint = None;
-    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
+    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, args.threat_dropout, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
         let optimizer_step = completed_step_offset + seen_steps;
