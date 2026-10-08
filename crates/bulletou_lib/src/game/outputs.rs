@@ -939,7 +939,8 @@ fn shogi_sfnn_progress_q16_thresholds() -> &'static [i64; SHOGI_SFNN_PROGRESS_VA
     SHOGI_SFNN_PROGRESS_Q16_THRESHOLDS.get_or_init(|| {
         std::array::from_fn(|i| {
             let p = (i + 1) as f64 / SHOGI_SFNN_PROGRESS_VALUE_COUNT as f64;
-            (p.ln() - (1.0 - p).ln()).mul_add(65_536.0, 0.0).round() as i64
+            // 探索側 (evaluate_nnue.cpp make_thresholds_q16) と同じ式: round(log(p / (1 - p)) * 65536)
+            ((p / (1.0 - p)).ln() * 65_536.0).round() as i64
         })
     })
 }

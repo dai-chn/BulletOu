@@ -2173,6 +2173,23 @@ fn load_sfnn_progress_q16_params_from_file(path: &Path) -> Result<ShogiSfnnProgr
     let weight_count = SHOGI_SFNN_PROGRESS_WEIGHT_COUNT;
     let q16_len = std::mem::size_of::<i32>() + weight_count * std::mem::size_of::<i32>();
     let hashed_q16_len = std::mem::size_of::<u32>() + q16_len;
+    let double_len = weight_count * std::mem::size_of::<f64>();
+
+    if bytes.len() == double_len {
+        // やねうら王 (upstream e47d460f、tatara 形式) の progress.bin: ヘッダ無し little-endian double × 81 × 1548、bias 無し。
+        // 探索側 (evaluate_nnue.cpp Progress::Parameters::ReadParameters) と同じ q16 化: round(v × 65536) を i32 に clamp。
+        let weights = bytes
+            .chunks_exact(std::mem::size_of::<f64>())
+            .map(|chunk| {
+                let value = f64::from_le_bytes(chunk.try_into().expect("chunk len checked"));
+                if !value.is_finite() {
+                    return Err(format!("SFNN progress.bin {} contains a non-finite weight", path.display()));
+                }
+                Ok((value * 65_536.0).round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        return ShogiSfnnProgressQ16Params::new(0, weights);
+    }
 
     let payload = if bytes.len() == hashed_q16_len {
         let hash = u32::from_le_bytes(bytes[0..4].try_into().expect("slice len checked"));
@@ -2187,9 +2204,10 @@ fn load_sfnn_progress_q16_params_from_file(path: &Path) -> Result<ShogiSfnnProgr
         &bytes[..]
     } else {
         return Err(format!(
-            "SFNN progress params size mismatch for {}: got {} bytes; expected q16 {} bytes or hashed q16 {} bytes",
+            "SFNN progress params size mismatch for {}: got {} bytes; expected progress.bin (double) {} bytes, q16 {} bytes or hashed q16 {} bytes",
             path.display(),
             bytes.len(),
+            double_len,
             q16_len,
             hashed_q16_len
         ));
@@ -10632,7 +10650,8 @@ fn write_cuda_cpp_sfnn_nn_bin(
         shape.num_stacks,
         l1_qb
     );
-    let sfnn_hash = if progress_params.is_some() { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
+    // progress bucket 付きでも hash は素の KHASH_SFNN (upstream e47d460f: nn.bin に Progress セクションを持たない)。
+    let sfnn_hash = KHASH_SFNN;
     writer
         .write_all(&SFNN_NNUE_VERSION.to_le_bytes())
         .and_then(|_| writer.write_all(&sfnn_hash.to_le_bytes()))
@@ -10644,15 +10663,26 @@ fn write_cuda_cpp_sfnn_nn_bin(
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0b", &weights.l0b, f32::from(SFNN_QA))?;
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0w", l0w_for_export, f32::from(SFNN_QA))?;
     if let Some(params) = progress_params {
-        writer
-            .write_all(&SHOGI_SFNN_PROGRESS_HASH.to_le_bytes())
-            .and_then(|_| writer.write_all(&params.bias_q16.to_le_bytes()))
-            .map_err(|err| format!("failed to write SFNN progress params header {}: {err}", path.display()))?;
-        for &weight in params.weights_q16.iter() {
-            writer
-                .write_all(&weight.to_le_bytes())
-                .map_err(|err| format!("failed to write SFNN progress params {}: {err}", path.display()))?;
+        // tatara 形式: nn.bin には埋め込まず、同じフォルダの progress.bin (ヘッダ無し double × 81 × 1548、bias 無し) に書く。
+        // 値は q16 / 65536 なので、探索側の round(v × 65536) で同じ q16 に戻る (bucket 境界の一致)。
+        if params.bias_q16 != 0 {
+            return Err(format!(
+                "SFNN progress params with non-zero bias ({}) cannot be written as progress.bin (YaneuraOu reads bias-free doubles)",
+                params.bias_q16
+            ));
         }
+        let progress_path = path.with_file_name("progress.bin");
+        let progress_file = std::fs::File::create(&progress_path)
+            .map_err(|err| format!("failed to create {}: {err}", progress_path.display()))?;
+        let mut progress_writer = std::io::BufWriter::new(progress_file);
+        for &weight in params.weights_q16.iter() {
+            progress_writer
+                .write_all(&(f64::from(weight) / 65_536.0).to_le_bytes())
+                .map_err(|err| format!("failed to write SFNN progress.bin {}: {err}", progress_path.display()))?;
+        }
+        progress_writer
+            .flush()
+            .map_err(|err| format!("failed to flush SFNN progress.bin {}: {err}", progress_path.display()))?;
     }
 
     let l1_out = shape.l1_out();
