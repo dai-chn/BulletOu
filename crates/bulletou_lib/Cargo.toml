@@ -127,3 +127,7 @@ path = "../../examples/scan_bad_records.rs"
 [[example]]
 name = "recover_experiment"
 path = "../../examples/recover_experiment.rs"
+
+[[example]]
+name = "dump_layerstack_buckets"
+path = "../../examples/dump_layerstack_buckets.rs"

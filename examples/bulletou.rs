@@ -7819,11 +7819,19 @@ fn run_cuda_cpp_sfnn_export(args: &Args) -> Result<(), String> {
         l3axb: w.l3axb,
     };
     let factorizer = effective_sfnn_factorizer_spec(args);
+    // progress bucket arch なら --sfnn-progress-params を読み、nn.bin の隣に progress.bin (tatara 形式) も書く
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+    let progress_params = sfnn_progress_params_for_layerstack(args, layerstack)?;
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    write_cuda_cpp_sfnn_nn_bin(out, feature_kind, shape, &readback, factorizer, None, args.sfnn_l1_qb)?;
-    println!("exported {} (sfnn_l1_qb={})", out.display(), args.sfnn_l1_qb);
+    write_cuda_cpp_sfnn_nn_bin(out, feature_kind, shape, &readback, factorizer, progress_params.as_ref(), args.sfnn_l1_qb)?;
+    println!(
+        "exported {} (sfnn_l1_qb={}{})",
+        out.display(),
+        args.sfnn_l1_qb,
+        if progress_params.is_some() { ", progress.bin written" } else { "" }
+    );
     Ok(())
 }
 
