@@ -31,12 +31,26 @@ pub struct ThreatDropout<T: Clone> {
     /// 落とす確率 (Q16 固定小数、0..=65536)
     pub prob_q16: u32,
     pub seed: u64,
+    /// false (既定) = threat 行 (index >= threat_begin) を落とす。true = KA2 行 (index < threat_begin) を落とす (KA2 dropout、threat だけの頭を学習させる)
+    pub drop_below: bool,
 }
 
 impl<T: Clone> ThreatDropout<T> {
     pub fn new(inner: T, threat_begin: usize, prob: f32, seed: u64) -> Self {
         let prob_q16 = (prob.clamp(0.0, 1.0) * 65536.0).round() as u32;
-        Self { inner, threat_begin, prob_q16, seed }
+        Self { inner, threat_begin, prob_q16, seed, drop_below: false }
+    }
+
+    /// KA2 dropout: index < threat_begin (KA2 行) をサンプル単位で落とす
+    pub fn new_ka2(inner: T, threat_begin: usize, prob: f32, seed: u64) -> Self {
+        let mut d = Self::new(inner, threat_begin, prob, seed);
+        d.drop_below = true;
+        d
+    }
+
+    #[inline]
+    fn keep_index(&self, i: usize) -> bool {
+        if self.drop_below { i >= self.threat_begin } else { i < self.threat_begin }
     }
 
     #[inline]
@@ -57,9 +71,8 @@ impl<T: SparseInputType> SparseInputType for ThreatDropout<T> {
             self.inner.map_features(pos, f);
             return;
         }
-        let tb = self.threat_begin;
         self.inner.map_features(pos, |stm, nstm| {
-            if stm < tb && nstm < tb {
+            if self.keep_index(stm) && self.keep_index(nstm) {
                 f(stm, nstm);
             }
         });
@@ -70,9 +83,8 @@ impl<T: SparseInputType> SparseInputType for ThreatDropout<T> {
             self.inner.map_features_split(pos, f);
             return;
         }
-        let tb = self.threat_begin;
         self.inner.map_features_split(pos, |stm, nstm| {
-            let keep = |x: Option<usize>| x.filter(|&i| i < tb);
+            let keep = |x: Option<usize>| x.filter(|&i| self.keep_index(i));
             let (s, n) = (keep(stm), keep(nstm));
             if s.is_some() || n.is_some() {
                 f(s, n);
@@ -89,7 +101,7 @@ impl<T: SparseInputType> SparseInputType for ThreatDropout<T> {
     }
 
     fn description(&self) -> String {
-        format!("{} + threat dropout p={:.3}", self.inner.description(), f64::from(self.prob_q16) / 65536.0)
+        format!("{} + {} dropout p={:.3}", self.inner.description(), if self.drop_below { "ka2" } else { "threat" }, f64::from(self.prob_q16) / 65536.0)
     }
 
     fn shorthand(&self) -> String {
