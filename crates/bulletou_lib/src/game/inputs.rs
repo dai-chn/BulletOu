@@ -15,6 +15,7 @@ mod shogi_halfka_hm_threat;
 mod shogi_halfka2_threat;
 mod shogi_halfka2_threat_dropfact;
 mod shogi_halfka2_threat_effect;
+mod shogi_halfka2_threat_drop_f3;
 mod shogi_halfkp;
 mod shogi_halfkpe9;
 mod shogi_halfkpvm;
@@ -51,6 +52,9 @@ pub use shogi_halfka2_threat_dropfact::{
 };
 pub use shogi_halfka2_threat_effect::{
     HALFKA2_THREATEFFECT_DIMENSIONS, HALFKA2_THREATEFFECT_TOTAL_DIMENSIONS, ShogiHalfKa2ThreatEffect,
+};
+pub use shogi_halfka2_threat_drop_f3::{
+    DROP_F3_DIMENSIONS, HALFKA2_THREAT_DROPF3_TOTAL_DIMENSIONS, MAX_ACTIVE_DROPF3_FEATURES, ShogiHalfKa2ThreatDropF3,
 };
 pub use shogi_halfka_hm1::{FEATURE_HASH_HALFKA_HM1, HALFKA_HM1_DIMENSIONS, ShogiHalfKaHm1};
 pub use shogi_halfka_hm2::{FEATURE_HASH_HALFKA_HM2, HALFKA_HM2_DIMENSIONS, ShogiHalfKaHm2};
