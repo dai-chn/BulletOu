@@ -125,6 +125,10 @@ name = "scan_bad_records"
 path = "../../examples/scan_bad_records.rs"
 
 [[example]]
+name = "dump_drop_f3"
+path = "../../examples/dump_drop_f3.rs"
+
+[[example]]
 name = "recover_experiment"
 path = "../../examples/recover_experiment.rs"
 
